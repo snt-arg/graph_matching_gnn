@@ -6,7 +6,7 @@ import math
 cfg = {
     "AFA":{
       "K_FACTOR": 50,
-      "UNIV_SIZE": 128,
+      "UNIV_SIZE": 32,
       "REGRESSION": True,
       "HEAD_NUM": 8,
       "KQV_DIM": 16,
