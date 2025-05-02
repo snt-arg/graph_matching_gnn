@@ -19,7 +19,7 @@ if not os.path.exists(GNN_PATH):
 # %%
 # Install packages
 import subprocess
-subprocess.run(["pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "moviepy", "matplotlib"], check=True)
+subprocess.run(["pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "moviepy", "matplotlib", "numpy"], check=True)
 #check if pygmtools is installed
 try:
     import pygmtools
@@ -69,7 +69,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GATv2Conv, GCNConv
 
-from moviepy.editor import ImageSequenceClip
+# from moviepy.editor import ImageSequenceClip
 
 import pygmtools
 pygmtools.BACKEND = 'pytorch'
@@ -850,52 +850,52 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
 #            XAI UTILS
 #----------------------------------------
 
-def plt2arr(fig):
-    # Convert a Matplotlib figure to a NumPy array (RGB format)
-    rgb_str = fig.canvas.tostring_rgb()
-    (w, h) = fig.canvas.get_width_height()
-    return np.frombuffer(rgb_str, dtype=np.uint8).reshape((h, w, -1))
+# def plt2arr(fig):
+#     # Convert a Matplotlib figure to a NumPy array (RGB format)
+#     rgb_str = fig.canvas.tostring_rgb()
+#     (w, h) = fig.canvas.get_width_height()
+#     return np.frombuffer(rgb_str, dtype=np.uint8).reshape((h, w, -1))
 
-def visualize(h, color, epoch):
-    # Visualize embeddings using t-SNE and return the visualization as an image array
-    fig = plt.figure(figsize=(5,5), frameon=False)
-    fig.suptitle(f'Epoch index = {epoch}')
-    z = TSNE(n_components=2).fit_transform(h.detach().cpu().numpy())  # Reduce dimensions to 2D
-    plt.xticks([]); plt.yticks([])  # Remove axis ticks
-    plt.scatter(z[:, 0], z[:, 1],
-                s=70,
-                c=color.detach().cpu().numpy(),
-                cmap="Set2")  # Scatter plot with color labels
-    fig.canvas.draw()
-    arr = plt2arr(fig)  # Convert the figure to an array
-    plt.close(fig)  # Close the figure to free memory
-    return arr
+# def visualize(h, color, epoch):
+#     # Visualize embeddings using t-SNE and return the visualization as an image array
+#     fig = plt.figure(figsize=(5,5), frameon=False)
+#     fig.suptitle(f'Epoch index = {epoch}')
+#     z = TSNE(n_components=2).fit_transform(h.detach().cpu().numpy())  # Reduce dimensions to 2D
+#     plt.xticks([]); plt.yticks([])  # Remove axis ticks
+#     plt.scatter(z[:, 0], z[:, 1],
+#                 s=70,
+#                 c=color.detach().cpu().numpy(),
+#                 cmap="Set2")  # Scatter plot with color labels
+#     fig.canvas.draw()
+#     arr = plt2arr(fig)  # Convert the figure to an array
+#     plt.close(fig)  # Close the figure to free memory
+#     return arr
 
-def create_embedding_gif(all_embeddings, output_path, fps=1):
-    """
-    Create a GIF to visualize the evolution of embeddings over epochs.
+# def create_embedding_gif(all_embeddings, output_path, fps=1):
+#     """
+#     Create a GIF to visualize the evolution of embeddings over epochs.
     
-    all_embeddings : List of tuples (h1, h2), torch.Tensor each [Ni * D]
-    output_path    : str, path to save the GIF, e.g., "embeddings.gif"
-    fps            : int, frames per second for the GIF
-    """
-    num = len(all_embeddings)
-    step = max(1, int(num * 0.05))  # Select a subset of embeddings for visualization
-    indices = list(range(0, num, step))
+#     all_embeddings : List of tuples (h1, h2), torch.Tensor each [Ni * D]
+#     output_path    : str, path to save the GIF, e.g., "embeddings.gif"
+#     fps            : int, frames per second for the GIF
+#     """
+#     num = len(all_embeddings)
+#     step = max(1, int(num * 0.05))  # Select a subset of embeddings for visualization
+#     indices = list(range(0, num, step))
     
-    images = []
-    for idx in indices:
-        h1, h2 = all_embeddings[idx]
-        h = torch.cat([h1, h2], dim=0)  # Concatenate embeddings from two graphs
-        labels = torch.cat([
-            torch.zeros(h1.size(0), dtype=torch.long),  # Label for graph 1
-            torch.ones(h2.size(0),  dtype=torch.long)  # Label for graph 2
-        ], dim=0)
-        images.append(visualize(h, color=labels, epoch=idx))  # Generate visualization for the current epoch
+#     images = []
+#     for idx in indices:
+#         h1, h2 = all_embeddings[idx]
+#         h = torch.cat([h1, h2], dim=0)  # Concatenate embeddings from two graphs
+#         labels = torch.cat([
+#             torch.zeros(h1.size(0), dtype=torch.long),  # Label for graph 1
+#             torch.ones(h2.size(0),  dtype=torch.long)  # Label for graph 2
+#         ], dim=0)
+#         images.append(visualize(h, color=labels, epoch=idx))  # Generate visualization for the current epoch
     
-    clip = ImageSequenceClip(images, fps=fps)  # Create a GIF from the sequence of images
-    clip.write_gif(output_path, fps=fps)  # Save the GIF to the specified path
-    print(f"GIF saved at: {output_path}")
+#     clip = ImageSequenceClip(images, fps=fps)  # Create a GIF from the sequence of images
+#     clip.write_gif(output_path, fps=fps)  # Save the GIF to the specified path
+#     print(f"GIF saved at: {output_path}")
 
 # # Example usage:
 # # create_embedding_gif(all_embeddings, "embeddings_evolution.gif", fps=1)
