@@ -19,17 +19,17 @@ if not os.path.exists(GNN_PATH):
 # %%
 # Install packages
 import subprocess
-subprocess.run(["pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "moviepy", "matplotlib", "numpy"], check=True)
+#subprocess.run(["pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "moviepy", "matplotlib", "numpy"], check=True)
 #check if pygmtools is installed
-try:
-    import pygmtools
-except ImportError:#pygmtools library
-    subprocess.run(["pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"], check=True)
+#try:
+#   import pygmtools
+#except ImportError:#pygmtools library
+#    subprocess.run(["pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"], check=True)
 
 # Check pytorch version and make sure you use a GPU Kernel
 import torch
-print("PyTorch version:", torch.__version__)
-print("CUDA version:", torch.version.cuda)
+# print("PyTorch version:", torch.__version__)
+# print("CUDA version:", torch.version.cuda)
 
 # # Check CUDA version
 # subprocess.run(["nvcc", "--version"], check=True)
@@ -61,7 +61,6 @@ from sklearn.manifold import TSNE
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
