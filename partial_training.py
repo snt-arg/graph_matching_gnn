@@ -2722,7 +2722,7 @@ print(d1)
 print(d2)
 print(gt)
 print(gt.shape)
-plot_two_graphs_with_matching([d1,d2],gt_perm=gt,original_graphs=original_graphs,noise_graphs=noise_graphs)
+# plot_two_graphs_with_matching([d1,d2],gt_perm=gt,original_graphs=original_graphs,noise_graphs=noise_graphs)
 
 # %%
 train_dataset = GraphMatchingDataset(train_list)
@@ -3061,16 +3061,16 @@ print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
 g1_out, g2_perm, gt_perm = test_list[3]
 result = predict_matching_matrix(model, g1_out, g2_perm)
 
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=result,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="wrong",
-)
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=result,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="wrong",
+# )
 
 # %% [markdown]
 # ## Room Dropout
