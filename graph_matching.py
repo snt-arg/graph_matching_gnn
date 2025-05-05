@@ -891,15 +891,20 @@ def visualize(h, color, epoch):
     plt.close(fig)
     return arr
 
-
-def create_embedding_gif_per_epoch(history, output_path, pair=0, fps=1):
-    # evita residui di figure precedenti
+def create_embedding_gif_stride(
+    history, 
+    output_path, 
+    pair=0, 
+    fps=1, 
+    step=5      # un frame ogni 5 epoche
+):
+    # chiudo tutte le figure residue
     plt.close('all')
 
     images = []
-    for epoch, epoch_embs in enumerate(history):
-        h1, h2 = epoch_embs[pair]
-        # costruisco le etichette
+    # scorri solo gli epoch che sono multipli di `step`
+    for epoch in range(0, len(history), step):
+        h1, h2 = history[epoch][pair]
         N1, N2 = h1.size(0), h2.size(0)
         labels = torch.cat([
             torch.zeros(N1, dtype=torch.long),
@@ -907,32 +912,12 @@ def create_embedding_gif_per_epoch(history, output_path, pair=0, fps=1):
         ], dim=0)
 
         h = torch.cat([h1, h2], dim=0)
+        # passo l'epoch reale così sul titolo vedi il numero corretto
         images.append(visualize(h, labels, epoch))
 
     clip = ImageSequenceClip(images, fps=fps)
     clip.write_gif(output_path, fps=fps)
     print(f"GIF saved at: {output_path}")
-
-
-# def create_embedding_gif_per_epoch(history, output_path, pair=0, fps=1):
-#     images = []
-#     for epoch, epoch_embs in enumerate(history):
-#         # prendo la coppia 'pair' di embeddings
-#         h1, h2 = epoch_embs[pair]
-#         h = torch.cat([h1, h2], dim=0)
-
-#         # etichette corrette
-#         labels = torch.cat([
-#             torch.zeros(h1.size(0), dtype=torch.long),
-#             torch.ones( h2.size(0), dtype=torch.long)
-#         ], dim=0)
-
-#         # genero il frame
-#         images.append(visualize(h, labels, epoch, cmap="tab10"))
-
-#     clip = ImageSequenceClip(images, fps=fps)
-#     clip.write_gif(output_path, fps=fps)
-#     print(f"GIF saved at: {output_path}")
 
 # create_embedding_gif_per_epoch(val_embeddings_history, "embeddings_evolution.gif", fps=1)
 
