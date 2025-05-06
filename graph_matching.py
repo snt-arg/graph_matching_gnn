@@ -1060,7 +1060,7 @@ print(f"Number of original graphs: {len(original_graphs)}")
 print(original_graphs[0])
 print(original_graphs[0].nodes(data=True))
 print(original_graphs[0].edges(data=True))
-plot_a_graph([original_graphs[0]], path=os.path.join(gm_path, "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+plot_a_graph([original_graphs[0]], path=os.path.join(gm_path, "equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
 
 # %% [markdown]
 # #### Generate G1,G2,GT dataset
@@ -1138,7 +1138,7 @@ print(f"Number of original graphs: {len(noise_graphs)}")
 print(noise_graphs[0])
 print(noise_graphs[0].nodes(data=True))
 print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "local", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
 
 # %% [markdown]
 # #### Generate G1,G2,GT dataset
@@ -1217,7 +1217,7 @@ print(f"Number of original graphs: {len(noise_graphs)}")
 print(noise_graphs[0])
 print(noise_graphs[0].nodes(data=True))
 print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "global", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
 
 # %% [markdown]
 # #### Generate G1,G2,GT dataset
@@ -1296,7 +1296,7 @@ print(f"Number of original graphs: {len(noise_graphs)}")
 print(noise_graphs[0])
 print(noise_graphs[0].nodes(data=True))
 print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "global_local", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
 
 # %% [markdown]
 # #### Generate G1,G2,GT dataset
@@ -1378,7 +1378,7 @@ print(f"Number of original graphs: {len(noise_graphs)}")
 print(noise_graphs[0])
 print(noise_graphs[0].nodes(data=True))
 print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "ws_dropout", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
 
 # %% [markdown]
 # #### Generate G1,G2,GT dataset
