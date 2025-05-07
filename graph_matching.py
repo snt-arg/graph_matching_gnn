@@ -679,11 +679,102 @@ def collate_pyg_matching(batch):
     return batch1, batch2, perm_list
 
 
-def train_epoch_sinkhorn(model, loader, optimizer):
-    model.train()
-    total_loss = 0
-    all_embeddings = []
+# def train_epoch_sinkhorn(model, loader, optimizer):
+#     model.train()
+#     total_loss = 0
+#     all_embeddings = []
 
+#     device = next(model.parameters()).device
+
+#     for batch1, batch2, perm_list in loader:
+#         batch1 = batch1.to(device)
+#         batch2 = batch2.to(device)
+#         perm_list = [p.to(device) for p in perm_list]
+
+#         optimizer.zero_grad()
+#         batch_idx1 = batch1.batch
+#         batch_idx2 = batch2.batch
+
+#         pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
+
+#         loss = sum(F.binary_cross_entropy(pred, target) for pred, target in zip(pred_perm_list, perm_list))
+#         loss /= len(perm_list)
+
+#         loss.backward()
+#         optimizer.step()
+
+#         total_loss += loss.item()
+#         all_embeddings.extend(batch_embeddings)
+
+#     avg_loss = total_loss / len(loader)
+#     return avg_loss, all_embeddings
+
+
+# def evaluate_sinkhorn(model, loader):
+#     model.eval()
+#     correct = 0
+#     total = 0
+#     total_loss = 0
+#     all_embeddings = []
+
+#     device = next(model.parameters()).device
+
+#     with torch.no_grad():
+#         for batch1, batch2, perm_list in loader:
+#             batch1 = batch1.to(device)
+#             batch2 = batch2.to(device)
+#             perm_list = [p.to(device) for p in perm_list]
+
+#             batch_idx1 = batch1.batch
+#             batch_idx2 = batch2.batch
+
+#             pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
+
+#             for pred, target in zip(pred_perm_list, perm_list):
+#                 pred_indices = pred.argmax(dim=1)
+#                 target_indices = target.argmax(dim=1)
+
+#                 correct += (pred_indices == target_indices).sum().item()
+#                 total += pred.size(0)
+
+#             loss = sum(F.binary_cross_entropy(pred, target) for pred, target in zip(pred_perm_list, perm_list))
+#             total_loss += loss.item()
+#             all_embeddings.extend(batch_embeddings)
+
+#     avg_acc = correct / total if total > 0 else 0.0
+#     avg_loss = total_loss / len(loader)
+#     return avg_acc, avg_loss, all_embeddings
+
+
+# def predict_matching_matrix(model, data1, data2, use_hungarian=True):
+#     model.eval()
+#     with torch.no_grad():
+#         data1 = data1.to(device)
+#         data2 = data2.to(device)
+#         batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
+#         batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
+
+#         sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2)
+#         sim = sim_matrix_list[0].unsqueeze(0)  # [1, N1, N2]
+
+#         n1 = torch.tensor([sim.shape[1]], dtype=torch.int32)
+#         n2 = torch.tensor([sim.shape[2]], dtype=torch.int32)
+
+#         if use_hungarian:
+#             return pygmtools.hungarian(sim, n1=n1, n2=n2).squeeze(0)
+#         else:
+#             return sim
+
+def train_epoch_sinkhorn(model, loader, optimizer, eps: float = 1e-9):
+    """
+    Trains one epoch of a Sinkhorn-based graph matching model using column-wise cross-entropy loss.
+    Returns:
+        avg_loss (float): average column CE loss per batch.
+        all_embeddings (list): collected embeddings from the model.
+    """
+    model.train()
+    total_loss = 0.0
+    all_embeddings = []
     device = next(model.parameters()).device
 
     for batch1, batch2, perm_list in loader:
@@ -694,31 +785,43 @@ def train_epoch_sinkhorn(model, loader, optimizer):
         optimizer.zero_grad()
         batch_idx1 = batch1.batch
         batch_idx2 = batch2.batch
-
         pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
 
-        loss = sum(F.binary_cross_entropy(pred, target) for pred, target in zip(pred_perm_list, perm_list))
-        loss /= len(perm_list)
+        # column-wise cross-entropy
+        batch_loss = 0.0
+        for P, P_gt in zip(pred_perm_list, perm_list):
+            # For each column j: -sum_i P_gt[i,j] * log(P[i,j])
+            ce_per_col = -torch.sum(P_gt * torch.log(P + eps), dim=0)
+            batch_loss += ce_per_col.mean()
+        batch_loss = batch_loss / len(pred_perm_list)
 
-        loss.backward()
+        batch_loss.backward()
         optimizer.step()
 
-        total_loss += loss.item()
+        total_loss += batch_loss.item()
         all_embeddings.extend(batch_embeddings)
 
     avg_loss = total_loss / len(loader)
     return avg_loss, all_embeddings
 
 
-def evaluate_sinkhorn(model, loader):
+def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
+    """
+    Evaluates a Sinkhorn-based graph matching model using column-wise cross-entropy
+    and permutation accuracy.
+    Returns:
+        avg_acc (float): permutation accuracy over all columns.
+        avg_loss (float): average column CE loss per example.
+        all_embeddings (list): collected embeddings from the model.
+    """
     model.eval()
     correct = 0
-    total = 0
-    total_loss = 0
+    total_cols = 0
+    total_loss = 0.0
+    num_graphs = 0
     all_embeddings = []
 
     device = next(model.parameters()).device
-
     with torch.no_grad():
         for batch1, batch2, perm_list in loader:
             batch1 = batch1.to(device)
@@ -727,27 +830,36 @@ def evaluate_sinkhorn(model, loader):
 
             batch_idx1 = batch1.batch
             batch_idx2 = batch2.batch
-
             pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
 
-            for pred, target in zip(pred_perm_list, perm_list):
-                pred_indices = pred.argmax(dim=1)
-                target_indices = target.argmax(dim=1)
+            for P, P_gt in zip(pred_perm_list, perm_list):
+                # permutation accuracy: column-wise argmax compare
+                pred_idx = P.argmax(dim=0)
+                target_idx = P_gt.argmax(dim=0)
+                correct += (pred_idx == target_idx).sum().item()
+                total_cols += P.shape[1]
 
-                correct += (pred_indices == target_indices).sum().item()
-                total += pred.size(0)
+                # column-wise CE loss
+                ce_per_col = -torch.sum(P_gt * torch.log(P + eps), dim=0)
+                total_loss += ce_per_col.mean().item()
+                num_graphs += 1
 
-            loss = sum(F.binary_cross_entropy(pred, target) for pred, target in zip(pred_perm_list, perm_list))
-            total_loss += loss.item()
             all_embeddings.extend(batch_embeddings)
 
-    avg_acc = correct / total if total > 0 else 0.0
-    avg_loss = total_loss / len(loader)
+    avg_acc = correct / total_cols if total_cols > 0 else 0.0
+    avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
     return avg_acc, avg_loss, all_embeddings
 
 
-def predict_matching_matrix(model, data1, data2, use_hungarian=True):
+def predict_matching_matrix(model, data1, data2, use_hungarian: bool = True):
+    """
+    Produces a matching matrix between data1 and data2.
+    If use_hungarian=True, applies the Hungarian algorithm to the similarity scores.
+    Otherwise returns the raw similarity matrix.
+    """
     model.eval()
+    device = next(model.parameters()).device
+
     with torch.no_grad():
         data1 = data1.to(device)
         data2 = data2.to(device)
@@ -757,13 +869,16 @@ def predict_matching_matrix(model, data1, data2, use_hungarian=True):
         sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2)
         sim = sim_matrix_list[0].unsqueeze(0)  # [1, N1, N2]
 
-        n1 = torch.tensor([sim.shape[1]], dtype=torch.int32)
-        n2 = torch.tensor([sim.shape[2]], dtype=torch.int32)
+        n1 = torch.tensor([sim.shape[1]], dtype=torch.int32, device=device)
+        n2 = torch.tensor([sim.shape[2]], dtype=torch.int32, device=device)
 
         if use_hungarian:
+            # returns a hard assignment matrix [N1, N2]
             return pygmtools.hungarian(sim, n1=n1, n2=n2).squeeze(0)
         else:
-            return sim
+            # return soft scores [N1, N2]
+            return sim.squeeze(0)
+
 
 def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
                best_model_path='checkpoint.pt', final_model_path='final_model.pt',
@@ -1004,8 +1119,10 @@ print("All advanced tests passed!")
 # │   │   ├── global_local
 # │   │   └── local
 # │   └── partial graph matching
-# │       ├── room_dropout
-# │       └── ws_dropout
+# │       ├── room_dropout_equal
+# │       ├── ws_dropout_equal
+# │       ├── room_dropout_noise
+# │       └── ws_dropout_noise
 # ├── preprocessed
 # │   ├── graph matching
 # │   │   ├── equal
@@ -1013,8 +1130,10 @@ print("All advanced tests passed!")
 # │   │   ├── global_local
 # │   │   └── local
 # │   └── partial graph matching
-# │       ├── room_dropout
-# │       └── ws_dropout
+# │       ├── room_dropout_equal
+# │       ├── ws_dropout_equal
+# │       ├── room_dropout_noise
+# │       └── ws_dropout_noise
 # └── raw
 #     ├── graph matching
 #     │   ├── equal
@@ -1022,8 +1141,10 @@ print("All advanced tests passed!")
 #     │   ├── global_local
 #     │   └── local
 #     └── partial graph matching
-#         ├── room_dropout
-#         └── ws_dropout
+#         ├── room_dropout_equal
+#         ├── ws_dropout_equal
+#         ├── room_dropout_noise
+#         └── ws_dropout_noise
 
 def create_dir_structure(base_dir="GNN"):
     categories = [
@@ -1031,8 +1152,10 @@ def create_dir_structure(base_dir="GNN"):
         "graph_matching/global",
         "graph_matching/global_local",
         "graph_matching/local",
-        "partial_graph_matching/room_dropout",
-        "partial_graph_matching/ws_dropout",
+        "partial_graph_matching/room_dropout_equal",
+        "partial_graph_matching/ws_dropout_equal",
+        "partial_graph_matching/room_dropout_noise",
+        "partial_graph_matching/ws_dropout_noise",
     ]
 
     levels = ["models", "preprocessed", "raw"]
@@ -1045,6 +1168,9 @@ def create_dir_structure(base_dir="GNN"):
 if __name__ == "__main__":
     create_dir_structure(GNN_PATH)
 
+
+# %% [markdown]
+# ## Graph Matching dataset
 
 # %% [markdown]
 # ### GM Equal
@@ -1362,7 +1488,10 @@ plot_two_graphs_with_matching(
 )
 
 # %% [markdown]
-# ### WS dropout
+# ## Partial Graph Matching dataset 
+
+# %% [markdown]
+# ### WS dropout equal
 
 # %%
 # graph matching-equal path
@@ -1370,7 +1499,7 @@ gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
 original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
 # graph matching path
 gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_dropout")
+noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_dropout_equal")
 
 # %%
 # Check the number of graphs
@@ -1378,7 +1507,7 @@ print(f"Number of original graphs: {len(noise_graphs)}")
 print(noise_graphs[0])
 print(noise_graphs[0].nodes(data=True))
 print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "ws_dropout", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "ws_dropout_equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
 
 # %% [markdown]
 # #### Generate G1,G2,GT dataset
@@ -1399,6 +1528,249 @@ val_pairs_norm = normalize_data_pairs(val, mean, std)
 test_pairs_norm = normalize_data_pairs(test, mean, std)
 
 gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout")
+serialize_graph_matching_dataset(
+    train_pairs_norm,
+    gm_equal_preprocessed_path,
+    "train_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    val_pairs_norm,
+    gm_equal_preprocessed_path,
+    "valid_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    test_pairs_norm,
+    gm_equal_preprocessed_path,
+    "test_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    noise_graphs,
+    gm_equal_preprocessed_path,
+    "noise.pkl"
+)
+
+g1_out, g2_perm, gt_perm = train[0]
+
+print(g1_out)
+print("G1 nodes:", g1_out.x[0])
+print(g2_perm)
+print("G2 permuted nodes:", g2_perm.x[0])
+print("Ground truth permutation:\n", gt_perm[0])
+
+# %%
+# Visualize the two graphs
+plot_two_graphs_with_matching(
+    [g1_out, g2_perm],
+    gt_perm=gt_perm,
+    pred_perm=gt_perm,
+    original_graphs=original_graphs,
+    noise_graphs=noise_graphs,
+    viz_rooms=True,
+    viz_ws=True,
+    match_display="all",
+    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+)
+
+# %% [markdown]
+# ### WS dropout noise
+
+# %%
+# graph matching-equal path
+gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# graph matching path
+gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_dropout_noise")
+
+# %%
+# Check the number of graphs
+print(f"Number of original graphs: {len(noise_graphs)}")
+print(noise_graphs[0])
+print(noise_graphs[0].nodes(data=True))
+print(noise_graphs[0].edges(data=True))
+plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "ws_dropout_noise", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# %% [markdown]
+# #### Generate G1,G2,GT dataset
+
+# %%
+pair_gt_list = []
+for i, g1 in enumerate(original_graphs):
+    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+train, val, test = split_graphs(pair_gt_list)
+
+# compute mean and std
+mean, std = compute_mean_std(train)
+
+# Normalizzazione dei set
+train_pairs_norm = normalize_data_pairs(train, mean, std)
+val_pairs_norm = normalize_data_pairs(val, mean, std)
+test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout_noise")
+serialize_graph_matching_dataset(
+    train_pairs_norm,
+    gm_equal_preprocessed_path,
+    "train_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    val_pairs_norm,
+    gm_equal_preprocessed_path,
+    "valid_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    test_pairs_norm,
+    gm_equal_preprocessed_path,
+    "test_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    noise_graphs,
+    gm_equal_preprocessed_path,
+    "noise.pkl"
+)
+
+g1_out, g2_perm, gt_perm = train[0]
+
+print(g1_out)
+print("G1 nodes:", g1_out.x[0])
+print(g2_perm)
+print("G2 permuted nodes:", g2_perm.x[0])
+print("Ground truth permutation:\n", gt_perm[0])
+
+# %%
+# Visualize the two graphs
+plot_two_graphs_with_matching(
+    [g1_out, g2_perm],
+    gt_perm=gt_perm,
+    pred_perm=gt_perm,
+    original_graphs=original_graphs,
+    noise_graphs=noise_graphs,
+    viz_rooms=True,
+    viz_ws=True,
+    match_display="all",
+    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+)
+
+# %% [markdown]
+# ### Room dropout equal
+
+# %%
+# graph matching-equal path
+gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# graph matching path
+gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="room_dropout_equal")
+
+# %%
+# Check the number of graphs
+print(f"Number of original graphs: {len(noise_graphs)}")
+print(noise_graphs[0])
+print(noise_graphs[0].nodes(data=True))
+print(noise_graphs[0].edges(data=True))
+plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "room_dropout_equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# %% [markdown]
+# #### Generate G1,G2,GT dataset
+
+# %%
+pair_gt_list = []
+for i, g1 in enumerate(original_graphs):
+    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+train, val, test = split_graphs(pair_gt_list)
+
+# compute mean and std
+mean, std = compute_mean_std(train)
+
+# Normalizzazione dei set
+train_pairs_norm = normalize_data_pairs(train, mean, std)
+val_pairs_norm = normalize_data_pairs(val, mean, std)
+test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_equal")
+serialize_graph_matching_dataset(
+    train_pairs_norm,
+    gm_equal_preprocessed_path,
+    "train_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    val_pairs_norm,
+    gm_equal_preprocessed_path,
+    "valid_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    test_pairs_norm,
+    gm_equal_preprocessed_path,
+    "test_dataset.pkl"
+)
+serialize_graph_matching_dataset(
+    noise_graphs,
+    gm_equal_preprocessed_path,
+    "noise.pkl"
+)
+
+g1_out, g2_perm, gt_perm = train[0]
+
+print(g1_out)
+print("G1 nodes:", g1_out.x[0])
+print(g2_perm)
+print("G2 permuted nodes:", g2_perm.x[0])
+print("Ground truth permutation:\n", gt_perm[0])
+
+# %%
+# Visualize the two graphs
+plot_two_graphs_with_matching(
+    [g1_out, g2_perm],
+    gt_perm=gt_perm,
+    pred_perm=gt_perm,
+    original_graphs=original_graphs,
+    noise_graphs=noise_graphs,
+    viz_rooms=True,
+    viz_ws=True,
+    match_display="all",
+    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+)
+
+# %% [markdown]
+# ### Room dropout noise
+
+# %%
+# graph matching-equal path
+gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# graph matching path
+gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="room_dropout_noise")
+
+# %%
+# Check the number of graphs
+print(f"Number of original graphs: {len(noise_graphs)}")
+print(noise_graphs[0])
+print(noise_graphs[0].nodes(data=True))
+print(noise_graphs[0].edges(data=True))
+plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "room_dropout_noise", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# %% [markdown]
+# #### Generate G1,G2,GT dataset
+
+# %%
+pair_gt_list = []
+for i, g1 in enumerate(original_graphs):
+    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+train, val, test = split_graphs(pair_gt_list)
+
+# compute mean and std
+mean, std = compute_mean_std(train)
+
+# Normalizzazione dei set
+train_pairs_norm = normalize_data_pairs(train, mean, std)
+val_pairs_norm = normalize_data_pairs(val, mean, std)
+test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_noise")
 serialize_graph_matching_dataset(
     train_pairs_norm,
     gm_equal_preprocessed_path,
@@ -1612,7 +1984,7 @@ for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
 print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
 
 # %%
-g1_out, g2_perm, gt_perm = test_list[1]
+g1_out, g2_perm, gt_perm = test_list[236]
 result = predict_matching_matrix(model, g1_out, g2_perm)
 
 plot_two_graphs_with_matching(
@@ -2204,13 +2576,13 @@ if destination_dir not in sys.path:
     sys.path.append(destination_dir)
 
 # %% [markdown]
-# ## Ws dropout
+# ## Ws dropout equal
 
 # %%
 #load preprocessed dataset
 gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
-gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout")
-models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_dropout")
+gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout_equal")
+models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_dropout_equal")
 
 original_graphs = deserialize_graph_matching_dataset(
     gm_equal_preprocessed_path,
@@ -2492,6 +2864,867 @@ plot_two_graphs_with_matching(
 )
 
 # %% [markdown]
-# ## Room Dropout
+# ## Ws dropout noise
+
+# %%
+#load preprocessed dataset
+gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
+gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout_noise")
+models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_dropout_noise")
+
+original_graphs = deserialize_graph_matching_dataset(
+    gm_equal_preprocessed_path,
+    "original.pkl"
+)
+noise_graphs = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "noise.pkl"
+)
+
+train_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "train_dataset.pkl"
+)
+val_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "valid_dataset.pkl"
+)
+test_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "test_dataset.pkl"
+)
+
+# %%
+d1,d2,gt = train_list[0]
+print(d1)
+print(d2)
+print(gt)
+print(gt.shape)
+plot_two_graphs_with_matching([d1,d2],gt_perm=gt,original_graphs=original_graphs,noise_graphs=noise_graphs,path=os.path.join(models_path, "train.png"))
+
+# %%
+train_dataset = GraphMatchingDataset(train_list)
+val_dataset = GraphMatchingDataset(val_list)
+test_dataset = GraphMatchingDataset(test_list)
+
+# %%
+# AFA-U inlier predictor and Top-K matching from AFAT
+from k_pred_net import Encoder as AFAUEncoder
+from sinkhorn_topk import soft_topk
+
+class MatchingModel_GATv2SinkhornTopK(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        sinkhorn_max_iter: int = 20,
+        sinkhorn_tau: float = 5e-2,
+    ):
+        super().__init__()
+        # ─── 1) GNN backbone: two-layer GATv2
+        # First GATv2Conv projects in_dim → hidden_dim, apply ReLU
+        # Second GATv2Conv projects hidden_dim → out_dim, no activation afterwards
+        self.gnn = nn.ModuleList([
+            GATv2Conv(in_dim, hidden_dim),
+            GATv2Conv(hidden_dim, out_dim),
+        ])
+        # InstanceNorm to normalize each [N1×N2] similarity map
+        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+
+        # # ─── 2) AFA-U “unified” module to predict number of inliers K
+        # #  univ_size = maximum graph size, used to pad all embeddings to fixed length
+        # self.k_top_encoder = AFAUEncoder()
+
+        # # Two small MLPs to reduce pooled embedding → scalar in [0,1]
+        # self.final_row = nn.Sequential(
+        #     nn.Linear(out_dim, 8),
+        #     nn.ReLU(),
+        #     nn.Linear(8, 1),
+        #     nn.Sigmoid()
+        # )
+        # self.final_col = nn.Sequential(
+        #     nn.Linear(out_dim, 8),
+        #     nn.ReLU(),
+        #     nn.Linear(8, 1),
+        #     nn.Sigmoid()
+        # )
+
+        # Sinkhorn-TopK hyperparams
+        self.sinkhorn_max_iter = sinkhorn_max_iter
+        self.sinkhorn_tau      = sinkhorn_tau
+
+    def encode(self, x, edge_index):
+        """
+        Pass input features x through the two GATv2Conv layers.
+        Apply ReLU after the first, but not after the last.
+        """
+        for i, conv in enumerate(self.gnn):
+            x = conv(x, edge_index)
+            if i < len(self.gnn) - 1:
+                x = F.relu(x)
+        return x
+
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+        """
+        batch1, batch2: PyG Data objects for the two graphs in each pair.
+        batch_idx1, batch_idx2: optional precomputed batch assignments.
+        Returns a list of final hard match matrices (perm_pred_list) and
+        the raw embeddings for each graph pair (all_embeddings).
+        """
+        # device = next(self.parameters()).device
+
+        # ─── 1) Unpack node features & edge indices, move to GPU/CPU
+        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+
+        # ─── 2) Determine which node belongs to which graph in the batch
+        #    If not supplied, read from Data.batch
+        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
+
+        # ─── 3) Encode both sets of nodes via the GNN
+        h1 = self.encode(x1, edge1)  # [total_nodes1, out_dim]
+        h2 = self.encode(x2, edge2)  # [total_nodes2, out_dim]
+
+        # How many graph pairs in this minibatch?
+        B = batch_idx1.max().item() + 1
+
+        perm_pred_list = []
+        all_embeddings = []
+
+        for b in range(B):
+            # Isolate embeddings for the b-th graph pair
+            h1_i = h1[batch_idx1 == b]  # shape [N1, d]
+            h2_i = h2[batch_idx2 == b]  # shape [N2, d]
+            N1, N2 = h1_i.size(0), h2_i.size(0)
+
+            # ─── 4) Compute raw similarity: dot product between all node pairs
+            sim = torch.matmul(h1_i, h2_i.T)    # [N1, N2]
+            # Normalize per-instance so Sinkhorn is stable
+            sim_b = sim.unsqueeze(0).unsqueeze(1)   # [1,1,N1,N2]
+            sim_n = self.inst_norm(sim_b).squeeze(1)  # [1,N1,N2]
+
+            # Prepare row/col sizes for pygmtools
+            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
+            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
+
+            # Soft Sinkhorn → soft_match [N1,N2]
+            # soft_S = pygmtools.sinkhorn(sim_n, n1=n1_t, n2=n2_t, dummy_row=False)[0]
+
+            # # ─── 5) AFA-U predicts inlier count K from soft matching
+            # #   a) Expand dims to batch form
+            # row_emb = h1_i.unsqueeze(0)      # [1, N1, d]
+            # col_emb = h2_i.unsqueeze(0)      # [1, N2, d]
+            # cost_mat = sim_n                 # [1, N1, N2]
+
+            # #   b) Run the bipartite-attention encoder
+            # out_r, out_c = self.k_top_encoder(row_emb, col_emb, cost_mat) # [1, N1, d], [1, N2, d]
+            
+            # #   c) Dynamic max over nodes
+            # g_r = out_r.max(dim=1).values     # [1, d]
+            # g_c = out_c.max(dim=1).values     # [1, d]
+
+            # #   d) Small MLPs → fraction in [0,1]
+            # k_r = self.final_row(g_r).squeeze(-1)  # [1]
+            # k_c = self.final_col(g_c).squeeze(-1)  # [1]
+            # ks  = (k_r + k_c) / 2                  # [1] average of row/col predictions
+
+            # ─── 6) Top-K matching
+
+            # use ground-truth K
+            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
+            hard_S, soft_S = soft_topk(
+                sim_n, ks_gt,
+                max_iter=self.sinkhorn_max_iter,
+                tau=self.sinkhorn_tau,
+                nrows=n1_t, ncols=n2_t,
+                return_prob=True
+            )
+
+            if self.training:
+                perm_pred_list.append(soft_S[0])
+            else:
+            #     ks_eff = (ks * N2).long()
+            #     hard_S = soft_topk(
+            #         sim_n, ks_eff,
+            #         max_iter=self.sinkhorn_max_iter,
+            #         tau=self.sinkhorn_tau,
+            #         nrows=n1_t, ncols=n2_t,
+            #         return_prob=False
+            #     )
+                perm_pred_list.append(hard_S[0])
+
+
+            # ─── 7) Collect outputs for this pair
+            all_embeddings.append((h1_i, h2_i))   # store embeddings for any downstream use
+
+        return perm_pred_list, all_embeddings
+
+# %%
+# Percorsi per salvare i modelli
+best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
+final_model_path = os.path.join(models_path, 'final_model.pt')
+
+# Iperparametri
+in_dim = 7
+hidden_dim = 64
+out_dim = 32
+num_epochs = 100
+learning_rate = 0.001
+batch_size = 3
+
+# Early stopping
+best_val_loss = float('inf')
+patience = 10
+patience_counter = 0
+best_epoch = -1
+
+# Loader
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+
+# Modello e ottimizzatore
+model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+#model summary
+print(model)
+print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+
+# %%
+train_losses, val_losses, val_embeddings_history = train_loop(
+    model=model,
+    optimizer=optimizer,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    num_epochs=num_epochs,
+    best_model_path=best_val_model_path,
+    final_model_path=final_model_path,
+    patience=patience,
+    resume=False
+)
+
+# %%
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), fps=0.001)
+
+# %%
+plot_losses(train_losses, val_losses, os.path.join(models_path, 'losses.png'))
+
+# %%
+checkpoint = torch.load(best_val_model_path, map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'])
+optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+model.to(device)
+
+# Evaluate on the test set
+test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
+print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
+
+inference_time = 0
+# use the model to predict the matching on a test graph
+for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
+    start_time = time.time()
+    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
+    end_time = time.time()
+    inference_time += end_time - start_time
+    errors = (result != gt_perm.to(result.device)).sum().item()
+    if errors > 0:
+        print(f"Graph {i}: Errors found: {errors}")
+
+print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
+
+# %%
+g1_out, g2_perm, gt_perm = test_list[3]
+result = predict_matching_matrix(model, g1_out, g2_perm)
+
+plot_two_graphs_with_matching(
+    [g1_out, g2_perm],
+    gt_perm=gt_perm,
+    pred_perm=result,
+    original_graphs=original_graphs,
+    noise_graphs=noise_graphs,
+    viz_rooms=True,
+    viz_ws=True,
+    match_display="wrong",
+    path=os.path.join(models_path, "test.png")
+)
+
+# %% [markdown]
+# ## Room dropout equal
+
+# %%
+#load preprocessed dataset
+gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
+gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_equal")
+models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "room_dropout_equal")
+
+original_graphs = deserialize_graph_matching_dataset(
+    gm_equal_preprocessed_path,
+    "original.pkl"
+)
+noise_graphs = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "noise.pkl"
+)
+
+train_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "train_dataset.pkl"
+)
+val_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "valid_dataset.pkl"
+)
+test_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "test_dataset.pkl"
+)
+
+# %%
+d1,d2,gt = train_list[0]
+print(d1)
+print(d2)
+print(gt)
+print(gt.shape)
+plot_two_graphs_with_matching([d1,d2],gt_perm=gt,original_graphs=original_graphs,noise_graphs=noise_graphs,path=os.path.join(models_path, "train.png"))
+
+# %%
+train_dataset = GraphMatchingDataset(train_list)
+val_dataset = GraphMatchingDataset(val_list)
+test_dataset = GraphMatchingDataset(test_list)
+
+# %%
+# AFA-U inlier predictor and Top-K matching from AFAT
+from k_pred_net import Encoder as AFAUEncoder
+from sinkhorn_topk import soft_topk
+
+class MatchingModel_GATv2SinkhornTopK(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        sinkhorn_max_iter: int = 20,
+        sinkhorn_tau: float = 5e-2,
+    ):
+        super().__init__()
+        # ─── 1) GNN backbone: two-layer GATv2
+        # First GATv2Conv projects in_dim → hidden_dim, apply ReLU
+        # Second GATv2Conv projects hidden_dim → out_dim, no activation afterwards
+        self.gnn = nn.ModuleList([
+            GATv2Conv(in_dim, hidden_dim),
+            GATv2Conv(hidden_dim, out_dim),
+        ])
+        # InstanceNorm to normalize each [N1×N2] similarity map
+        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+
+        # # ─── 2) AFA-U “unified” module to predict number of inliers K
+        # #  univ_size = maximum graph size, used to pad all embeddings to fixed length
+        # self.k_top_encoder = AFAUEncoder()
+
+        # # Two small MLPs to reduce pooled embedding → scalar in [0,1]
+        # self.final_row = nn.Sequential(
+        #     nn.Linear(out_dim, 8),
+        #     nn.ReLU(),
+        #     nn.Linear(8, 1),
+        #     nn.Sigmoid()
+        # )
+        # self.final_col = nn.Sequential(
+        #     nn.Linear(out_dim, 8),
+        #     nn.ReLU(),
+        #     nn.Linear(8, 1),
+        #     nn.Sigmoid()
+        # )
+
+        # Sinkhorn-TopK hyperparams
+        self.sinkhorn_max_iter = sinkhorn_max_iter
+        self.sinkhorn_tau      = sinkhorn_tau
+
+    def encode(self, x, edge_index):
+        """
+        Pass input features x through the two GATv2Conv layers.
+        Apply ReLU after the first, but not after the last.
+        """
+        for i, conv in enumerate(self.gnn):
+            x = conv(x, edge_index)
+            if i < len(self.gnn) - 1:
+                x = F.relu(x)
+        return x
+
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+        """
+        batch1, batch2: PyG Data objects for the two graphs in each pair.
+        batch_idx1, batch_idx2: optional precomputed batch assignments.
+        Returns a list of final hard match matrices (perm_pred_list) and
+        the raw embeddings for each graph pair (all_embeddings).
+        """
+        # device = next(self.parameters()).device
+
+        # ─── 1) Unpack node features & edge indices, move to GPU/CPU
+        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+
+        # ─── 2) Determine which node belongs to which graph in the batch
+        #    If not supplied, read from Data.batch
+        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
+
+        # ─── 3) Encode both sets of nodes via the GNN
+        h1 = self.encode(x1, edge1)  # [total_nodes1, out_dim]
+        h2 = self.encode(x2, edge2)  # [total_nodes2, out_dim]
+
+        # How many graph pairs in this minibatch?
+        B = batch_idx1.max().item() + 1
+
+        perm_pred_list = []
+        all_embeddings = []
+
+        for b in range(B):
+            # Isolate embeddings for the b-th graph pair
+            h1_i = h1[batch_idx1 == b]  # shape [N1, d]
+            h2_i = h2[batch_idx2 == b]  # shape [N2, d]
+            N1, N2 = h1_i.size(0), h2_i.size(0)
+
+            # ─── 4) Compute raw similarity: dot product between all node pairs
+            sim = torch.matmul(h1_i, h2_i.T)    # [N1, N2]
+            # Normalize per-instance so Sinkhorn is stable
+            sim_b = sim.unsqueeze(0).unsqueeze(1)   # [1,1,N1,N2]
+            sim_n = self.inst_norm(sim_b).squeeze(1)  # [1,N1,N2]
+
+            # Prepare row/col sizes for pygmtools
+            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
+            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
+
+            # Soft Sinkhorn → soft_match [N1,N2]
+            # soft_S = pygmtools.sinkhorn(sim_n, n1=n1_t, n2=n2_t, dummy_row=False)[0]
+
+            # # ─── 5) AFA-U predicts inlier count K from soft matching
+            # #   a) Expand dims to batch form
+            # row_emb = h1_i.unsqueeze(0)      # [1, N1, d]
+            # col_emb = h2_i.unsqueeze(0)      # [1, N2, d]
+            # cost_mat = sim_n                 # [1, N1, N2]
+
+            # #   b) Run the bipartite-attention encoder
+            # out_r, out_c = self.k_top_encoder(row_emb, col_emb, cost_mat) # [1, N1, d], [1, N2, d]
+            
+            # #   c) Dynamic max over nodes
+            # g_r = out_r.max(dim=1).values     # [1, d]
+            # g_c = out_c.max(dim=1).values     # [1, d]
+
+            # #   d) Small MLPs → fraction in [0,1]
+            # k_r = self.final_row(g_r).squeeze(-1)  # [1]
+            # k_c = self.final_col(g_c).squeeze(-1)  # [1]
+            # ks  = (k_r + k_c) / 2                  # [1] average of row/col predictions
+
+            # ─── 6) Top-K matching
+
+            # use ground-truth K
+            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
+            hard_S, soft_S = soft_topk(
+                sim_n, ks_gt,
+                max_iter=self.sinkhorn_max_iter,
+                tau=self.sinkhorn_tau,
+                nrows=n1_t, ncols=n2_t,
+                return_prob=True
+            )
+
+            if self.training:
+                perm_pred_list.append(soft_S[0])
+            else:
+            #     ks_eff = (ks * N2).long()
+            #     hard_S = soft_topk(
+            #         sim_n, ks_eff,
+            #         max_iter=self.sinkhorn_max_iter,
+            #         tau=self.sinkhorn_tau,
+            #         nrows=n1_t, ncols=n2_t,
+            #         return_prob=False
+            #     )
+                perm_pred_list.append(hard_S[0])
+
+
+            # ─── 7) Collect outputs for this pair
+            all_embeddings.append((h1_i, h2_i))   # store embeddings for any downstream use
+
+        return perm_pred_list, all_embeddings
+
+# %%
+# Percorsi per salvare i modelli
+best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
+final_model_path = os.path.join(models_path, 'final_model.pt')
+
+# Iperparametri
+in_dim = 7
+hidden_dim = 64
+out_dim = 32
+num_epochs = 100
+learning_rate = 0.001
+batch_size = 3
+
+# Early stopping
+best_val_loss = float('inf')
+patience = 10
+patience_counter = 0
+best_epoch = -1
+
+# Loader
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+
+# Modello e ottimizzatore
+model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+#model summary
+print(model)
+print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+
+# %%
+train_losses, val_losses, val_embeddings_history = train_loop(
+    model=model,
+    optimizer=optimizer,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    num_epochs=num_epochs,
+    best_model_path=best_val_model_path,
+    final_model_path=final_model_path,
+    patience=patience,
+    resume=False
+)
+
+# %%
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), fps=0.001)
+
+# %%
+plot_losses(train_losses, val_losses, os.path.join(models_path, 'losses.png'))
+
+# %%
+checkpoint = torch.load(best_val_model_path, map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'])
+optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+model.to(device)
+
+# Evaluate on the test set
+test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
+print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
+
+inference_time = 0
+# use the model to predict the matching on a test graph
+for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
+    start_time = time.time()
+    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
+    end_time = time.time()
+    inference_time += end_time - start_time
+    errors = (result != gt_perm.to(result.device)).sum().item()
+    if errors > 0:
+        print(f"Graph {i}: Errors found: {errors}")
+
+print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
+
+# %%
+g1_out, g2_perm, gt_perm = test_list[3]
+result = predict_matching_matrix(model, g1_out, g2_perm)
+
+plot_two_graphs_with_matching(
+    [g1_out, g2_perm],
+    gt_perm=gt_perm,
+    pred_perm=result,
+    original_graphs=original_graphs,
+    noise_graphs=noise_graphs,
+    viz_rooms=True,
+    viz_ws=True,
+    match_display="wrong",
+    path=os.path.join(models_path, "test.png")
+)
+
+# %% [markdown]
+# ## Room dropout noise
+
+# %%
+#load preprocessed dataset
+gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
+gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_noise")
+models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "room_dropout_noise")
+
+original_graphs = deserialize_graph_matching_dataset(
+    gm_equal_preprocessed_path,
+    "original.pkl"
+)
+noise_graphs = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "noise.pkl"
+)
+
+train_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "train_dataset.pkl"
+)
+val_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "valid_dataset.pkl"
+)
+test_list = deserialize_graph_matching_dataset(
+    gm_local_preprocessed_path,
+    "test_dataset.pkl"
+)
+
+# %%
+d1,d2,gt = train_list[0]
+print(d1)
+print(d2)
+print(gt)
+print(gt.shape)
+plot_two_graphs_with_matching([d1,d2],gt_perm=gt,original_graphs=original_graphs,noise_graphs=noise_graphs,path=os.path.join(models_path, "train.png"))
+
+# %%
+train_dataset = GraphMatchingDataset(train_list)
+val_dataset = GraphMatchingDataset(val_list)
+test_dataset = GraphMatchingDataset(test_list)
+
+# %%
+# AFA-U inlier predictor and Top-K matching from AFAT
+from k_pred_net import Encoder as AFAUEncoder
+from sinkhorn_topk import soft_topk
+
+class MatchingModel_GATv2SinkhornTopK(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        sinkhorn_max_iter: int = 20,
+        sinkhorn_tau: float = 5e-2,
+    ):
+        super().__init__()
+        # ─── 1) GNN backbone: two-layer GATv2
+        # First GATv2Conv projects in_dim → hidden_dim, apply ReLU
+        # Second GATv2Conv projects hidden_dim → out_dim, no activation afterwards
+        self.gnn = nn.ModuleList([
+            GATv2Conv(in_dim, hidden_dim),
+            GATv2Conv(hidden_dim, out_dim),
+        ])
+        # InstanceNorm to normalize each [N1×N2] similarity map
+        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+
+        # # ─── 2) AFA-U “unified” module to predict number of inliers K
+        # #  univ_size = maximum graph size, used to pad all embeddings to fixed length
+        # self.k_top_encoder = AFAUEncoder()
+
+        # # Two small MLPs to reduce pooled embedding → scalar in [0,1]
+        # self.final_row = nn.Sequential(
+        #     nn.Linear(out_dim, 8),
+        #     nn.ReLU(),
+        #     nn.Linear(8, 1),
+        #     nn.Sigmoid()
+        # )
+        # self.final_col = nn.Sequential(
+        #     nn.Linear(out_dim, 8),
+        #     nn.ReLU(),
+        #     nn.Linear(8, 1),
+        #     nn.Sigmoid()
+        # )
+
+        # Sinkhorn-TopK hyperparams
+        self.sinkhorn_max_iter = sinkhorn_max_iter
+        self.sinkhorn_tau      = sinkhorn_tau
+
+    def encode(self, x, edge_index):
+        """
+        Pass input features x through the two GATv2Conv layers.
+        Apply ReLU after the first, but not after the last.
+        """
+        for i, conv in enumerate(self.gnn):
+            x = conv(x, edge_index)
+            if i < len(self.gnn) - 1:
+                x = F.relu(x)
+        return x
+
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+        """
+        batch1, batch2: PyG Data objects for the two graphs in each pair.
+        batch_idx1, batch_idx2: optional precomputed batch assignments.
+        Returns a list of final hard match matrices (perm_pred_list) and
+        the raw embeddings for each graph pair (all_embeddings).
+        """
+        # device = next(self.parameters()).device
+
+        # ─── 1) Unpack node features & edge indices, move to GPU/CPU
+        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+
+        # ─── 2) Determine which node belongs to which graph in the batch
+        #    If not supplied, read from Data.batch
+        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
+
+        # ─── 3) Encode both sets of nodes via the GNN
+        h1 = self.encode(x1, edge1)  # [total_nodes1, out_dim]
+        h2 = self.encode(x2, edge2)  # [total_nodes2, out_dim]
+
+        # How many graph pairs in this minibatch?
+        B = batch_idx1.max().item() + 1
+
+        perm_pred_list = []
+        all_embeddings = []
+
+        for b in range(B):
+            # Isolate embeddings for the b-th graph pair
+            h1_i = h1[batch_idx1 == b]  # shape [N1, d]
+            h2_i = h2[batch_idx2 == b]  # shape [N2, d]
+            N1, N2 = h1_i.size(0), h2_i.size(0)
+
+            # ─── 4) Compute raw similarity: dot product between all node pairs
+            sim = torch.matmul(h1_i, h2_i.T)    # [N1, N2]
+            # Normalize per-instance so Sinkhorn is stable
+            sim_b = sim.unsqueeze(0).unsqueeze(1)   # [1,1,N1,N2]
+            sim_n = self.inst_norm(sim_b).squeeze(1)  # [1,N1,N2]
+
+            # Prepare row/col sizes for pygmtools
+            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
+            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
+
+            # Soft Sinkhorn → soft_match [N1,N2]
+            # soft_S = pygmtools.sinkhorn(sim_n, n1=n1_t, n2=n2_t, dummy_row=False)[0]
+
+            # # ─── 5) AFA-U predicts inlier count K from soft matching
+            # #   a) Expand dims to batch form
+            # row_emb = h1_i.unsqueeze(0)      # [1, N1, d]
+            # col_emb = h2_i.unsqueeze(0)      # [1, N2, d]
+            # cost_mat = sim_n                 # [1, N1, N2]
+
+            # #   b) Run the bipartite-attention encoder
+            # out_r, out_c = self.k_top_encoder(row_emb, col_emb, cost_mat) # [1, N1, d], [1, N2, d]
+            
+            # #   c) Dynamic max over nodes
+            # g_r = out_r.max(dim=1).values     # [1, d]
+            # g_c = out_c.max(dim=1).values     # [1, d]
+
+            # #   d) Small MLPs → fraction in [0,1]
+            # k_r = self.final_row(g_r).squeeze(-1)  # [1]
+            # k_c = self.final_col(g_c).squeeze(-1)  # [1]
+            # ks  = (k_r + k_c) / 2                  # [1] average of row/col predictions
+
+            # ─── 6) Top-K matching
+
+            # use ground-truth K
+            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
+            hard_S, soft_S = soft_topk(
+                sim_n, ks_gt,
+                max_iter=self.sinkhorn_max_iter,
+                tau=self.sinkhorn_tau,
+                nrows=n1_t, ncols=n2_t,
+                return_prob=True
+            )
+
+            if self.training:
+                perm_pred_list.append(soft_S[0])
+            else:
+            #     ks_eff = (ks * N2).long()
+            #     hard_S = soft_topk(
+            #         sim_n, ks_eff,
+            #         max_iter=self.sinkhorn_max_iter,
+            #         tau=self.sinkhorn_tau,
+            #         nrows=n1_t, ncols=n2_t,
+            #         return_prob=False
+            #     )
+                perm_pred_list.append(hard_S[0])
+
+
+            # ─── 7) Collect outputs for this pair
+            all_embeddings.append((h1_i, h2_i))   # store embeddings for any downstream use
+
+        return perm_pred_list, all_embeddings
+
+# %%
+# Percorsi per salvare i modelli
+best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
+final_model_path = os.path.join(models_path, 'final_model.pt')
+
+# Iperparametri
+in_dim = 7
+hidden_dim = 64
+out_dim = 32
+num_epochs = 100
+learning_rate = 0.001
+batch_size = 3
+
+# Early stopping
+best_val_loss = float('inf')
+patience = 10
+patience_counter = 0
+best_epoch = -1
+
+# Loader
+train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+
+# Modello e ottimizzatore
+model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+#model summary
+print(model)
+print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+
+# %%
+train_losses, val_losses, val_embeddings_history = train_loop(
+    model=model,
+    optimizer=optimizer,
+    train_loader=train_loader,
+    val_loader=val_loader,
+    num_epochs=num_epochs,
+    best_model_path=best_val_model_path,
+    final_model_path=final_model_path,
+    patience=patience,
+    resume=False
+)
+
+# %%
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), fps=0.001)
+
+# %%
+plot_losses(train_losses, val_losses, os.path.join(models_path, 'losses.png'))
+
+# %%
+checkpoint = torch.load(best_val_model_path, map_location=device)
+model.load_state_dict(checkpoint['model_state_dict'])
+optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+
+model.to(device)
+
+# Evaluate on the test set
+test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
+print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
+
+inference_time = 0
+# use the model to predict the matching on a test graph
+for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
+    start_time = time.time()
+    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
+    end_time = time.time()
+    inference_time += end_time - start_time
+    errors = (result != gt_perm.to(result.device)).sum().item()
+    if errors > 0:
+        print(f"Graph {i}: Errors found: {errors}")
+
+print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
+
+# %%
+g1_out, g2_perm, gt_perm = test_list[3]
+result = predict_matching_matrix(model, g1_out, g2_perm)
+
+plot_two_graphs_with_matching(
+    [g1_out, g2_perm],
+    gt_perm=gt_perm,
+    pred_perm=result,
+    original_graphs=original_graphs,
+    noise_graphs=noise_graphs,
+    viz_rooms=True,
+    viz_ws=True,
+    match_display="wrong",
+    path=os.path.join(models_path, "test.png")
+)
 
 
