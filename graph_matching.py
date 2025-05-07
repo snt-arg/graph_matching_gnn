@@ -37,7 +37,6 @@ except FileNotFoundError:
 
 #set device as cuda if available to load model and data on gpu
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 # %%
 # ─── Standard library ──────────────────────────────────────────────────────────
 import copy
@@ -1527,7 +1526,7 @@ train_pairs_norm = normalize_data_pairs(train, mean, std)
 val_pairs_norm = normalize_data_pairs(val, mean, std)
 test_pairs_norm = normalize_data_pairs(test, mean, std)
 
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout")
+gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout_equal")
 serialize_graph_matching_dataset(
     train_pairs_norm,
     gm_equal_preprocessed_path,
