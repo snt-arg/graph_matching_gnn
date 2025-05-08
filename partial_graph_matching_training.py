@@ -1095,8 +1095,8 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
-        sinkhorn_max_iter: int = 20,
-        sinkhorn_tau: float = 5e-2,
+        sinkhorn_max_iter: int = 10,
+        sinkhorn_tau: float = 1.0,
     ):
         super().__init__()
         # ─── 1) GNN backbone: two-layer GATv2
@@ -1299,18 +1299,20 @@ model.to(device)
 test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
 print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
 
-inference_time = 0
+inference_times = []
 # use the model to predict the matching on a test graph
 for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     start_time = time.time()
     result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
     end_time = time.time()
-    inference_time += end_time - start_time
+    inference_times.append(end_time - start_time)
     errors = (result != gt_perm.to(result.device)).sum().item()
     if errors > 0:
         print(f"Graph {i}: Errors found: {errors}")
 
-print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
+mean_inference_time = np.mean(inference_times)
+std_inference_time = np.std(inference_times)
+print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
 
 # %%
 g1_out, g2_perm, gt_perm = test_list[3]
@@ -1383,8 +1385,8 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
-        sinkhorn_max_iter: int = 20,
-        sinkhorn_tau: float = 5e-2,
+        sinkhorn_max_iter: int = 10,
+        sinkhorn_tau: float = 1.0,
     ):
         super().__init__()
         # ─── 1) GNN backbone: two-layer GATv2
@@ -1587,18 +1589,20 @@ model.to(device)
 test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
 print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
 
-inference_time = 0
+inference_times = []
 # use the model to predict the matching on a test graph
 for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     start_time = time.time()
     result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
     end_time = time.time()
-    inference_time += end_time - start_time
+    inference_times.append(end_time - start_time)
     errors = (result != gt_perm.to(result.device)).sum().item()
     if errors > 0:
         print(f"Graph {i}: Errors found: {errors}")
 
-print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
+mean_inference_time = np.mean(inference_times)
+std_inference_time = np.std(inference_times)
+print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
 
 # %%
 g1_out, g2_perm, gt_perm = test_list[3]
@@ -1671,8 +1675,8 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
-        sinkhorn_max_iter: int = 20,
-        sinkhorn_tau: float = 5e-2,
+        sinkhorn_max_iter: int = 10,
+        sinkhorn_tau: float = 1.0,
     ):
         super().__init__()
         # ─── 1) GNN backbone: two-layer GATv2
@@ -1875,18 +1879,20 @@ model.to(device)
 test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
 print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
 
-inference_time = 0
+inference_times = []
 # use the model to predict the matching on a test graph
 for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     start_time = time.time()
     result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
     end_time = time.time()
-    inference_time += end_time - start_time
+    inference_times.append(end_time - start_time)
     errors = (result != gt_perm.to(result.device)).sum().item()
     if errors > 0:
         print(f"Graph {i}: Errors found: {errors}")
 
-print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
+mean_inference_time = np.mean(inference_times)
+std_inference_time = np.std(inference_times)
+print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
 
 # %%
 g1_out, g2_perm, gt_perm = test_list[3]
@@ -1959,8 +1965,8 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
-        sinkhorn_max_iter: int = 20,
-        sinkhorn_tau: float = 5e-2,
+        sinkhorn_max_iter: int = 10,
+        sinkhorn_tau: float = 1.0,
     ):
         super().__init__()
         # ─── 1) GNN backbone: two-layer GATv2
@@ -2163,18 +2169,20 @@ model.to(device)
 test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
 print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
 
-inference_time = 0
+inference_times = []
 # use the model to predict the matching on a test graph
 for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     start_time = time.time()
     result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
     end_time = time.time()
-    inference_time += end_time - start_time
+    inference_times.append(end_time - start_time)
     errors = (result != gt_perm.to(result.device)).sum().item()
     if errors > 0:
         print(f"Graph {i}: Errors found: {errors}")
 
-print(f"Inference time: {inference_time/len(test_list):.6f} seconds")
+mean_inference_time = np.mean(inference_times)
+std_inference_time = np.std(inference_times)
+print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
 
 # %%
 g1_out, g2_perm, gt_perm = test_list[3]
