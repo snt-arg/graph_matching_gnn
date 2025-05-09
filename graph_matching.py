@@ -10,7 +10,7 @@ import subprocess
 import sys
 
 # Install required packages
-subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard"])
 
 # Check if pygmtools is installed
 try:
@@ -47,7 +47,9 @@ import pickle
 import random
 import time
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
+from datetime import datetime
+
 
 # ─── Third-party libraries ─────────────────────────────────────────────────────
 import matplotlib.pyplot as plt
@@ -65,6 +67,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.tensorboard import SummaryWriter
+
 
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GATv2Conv, GCNConv
@@ -698,6 +702,81 @@ def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torc
     std = x_all.std(dim=0)
     return mean, std
 
+#----------------------------------------
+#            LOGGING
+#----------------------------------------
+
+# Generic logger setup for any model/dataset
+def setup_tb_logger(
+    base_dir: str = "runs",
+    model_name: str = None,
+    dataset_name: str = None,
+    experiment_name: str = None
+) -> SummaryWriter:
+    """
+    Create a TensorBoard SummaryWriter with a structured log directory.
+
+    Args:
+        base_dir: root directory for all runs.
+        model_name: identifier for the model (e.g. "GATv2", "MyModel").
+        dataset_name: identifier for the dataset (e.g. "CIFAR10").
+        experiment_name: optional extra tag (e.g. "dropout0.3").
+
+    Returns:
+        writer: a SummaryWriter instance logging to runs/... directory.
+    """
+    parts = []
+    if model_name:
+        parts.append(model_name)
+    if dataset_name:
+        parts.append(dataset_name)
+    if experiment_name:
+        parts.append(experiment_name)
+    # timestamp for uniqueness
+    parts.append(datetime.now().strftime("%Y%m%d_%H%M%S"))
+    log_dir = os.path.join(base_dir, "__".join(parts))
+    writer = SummaryWriter(log_dir=log_dir)
+    return writer
+
+
+def log_gradients(
+    writer: SummaryWriter,
+    model: torch.nn.Module,
+    epoch: int,
+    prefix: str = "grad_norms"
+) -> None:
+    """
+    Log the L2 norm of gradients of all parameters in the model.
+
+    Args:
+        writer: SummaryWriter returned by setup_tb_logger.
+        model: the neural network model whose gradients to log.
+        epoch: current epoch or step index.
+        prefix: prefix for the TensorBoard tags.
+    """
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            writer.add_scalar(f"{prefix}/{name}", param.grad.norm().item(), epoch)
+
+
+def log_metrics(
+    writer: SummaryWriter,
+    metrics: Dict[str, float],
+    epoch: int,
+    prefix: str = ""
+) -> None:
+    """
+    Log arbitrary metrics (e.g. losses, accuracies) to TensorBoard.
+
+    Args:
+        writer: SummaryWriter returned by setup_tb_logger.
+        metrics: dict of metric_name -> value.
+        epoch: current epoch or step index.
+        prefix: optional prefix for tags (e.g. "train", "val").
+    """
+    for key, value in metrics.items():
+        tag = f"{prefix}/{key}" if prefix else key
+        writer.add_scalar(tag, value, epoch)
 
 #----------------------------------------
 #            TRAINING UTILS
@@ -835,7 +914,7 @@ def collate_pyg_matching(batch):
 #         else:
 #             return sim
 
-def train_epoch_sinkhorn(model, loader, optimizer, eps: float = 1e-9):
+def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1e-9):
     """
     Trains one epoch of a Sinkhorn-based graph matching model using column-wise cross-entropy loss.
     Returns:
@@ -866,6 +945,8 @@ def train_epoch_sinkhorn(model, loader, optimizer, eps: float = 1e-9):
         batch_loss = batch_loss / len(pred_perm_list)
 
         batch_loss.backward()
+        # Log gradients
+        log_gradients(writer, model, epoch)
         optimizer.step()
 
         total_loss += batch_loss.item()
@@ -950,7 +1031,7 @@ def predict_matching_matrix(model, data1, data2, use_hungarian: bool = True):
             return sim.squeeze(0)
 
 
-def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
+def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
                best_model_path='checkpoint.pt', final_model_path='final_model.pt',
                patience=10, resume=False):
     best_val_loss = float('inf')
@@ -978,9 +1059,12 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
     try:
         for epoch in range(start_epoch, num_epochs):
             # Train
-            train_loss, _ = train_epoch_sinkhorn(model, train_loader, optimizer)
+            train_loss, _ = train_epoch_sinkhorn(model, train_loader, optimizer, writer, epoch)
             # Evaluate
             val_acc, val_loss, val_embeddings = evaluate_sinkhorn(model, val_loader)
+            
+            log_metrics(writer, {"loss": train_loss}, epoch, prefix="train")
+            log_metrics(writer, {"loss": val_loss, "acc": val_acc}, epoch, prefix="val")
 
             train_losses.append(train_loss)
             val_losses.append(val_loss)
@@ -1010,6 +1094,9 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
 
     except KeyboardInterrupt:
         print("Training interrupted manually (Ctrl+C).")
+
+    log_metrics(writer, {"best_val_loss": best_val_loss, "best_epoch": best_epoch}, epoch, prefix="best")
+    writer.close()
 
     # Save final model
     torch.save({
@@ -1180,11 +1267,11 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
 in_dim = 7
 hidden_dim = 64
 out_dim = 32
-num_epochs = 100
+num_epochs = 200
 learning_rate = 1e-3
 batch_size = 16
-weight_decay = 1e-5
-patience = 15
+weight_decay = 5e-5
+patience = 30
 
 ###     GRAPH MATCHING MODEL
 class MatchingModel_GATv2Sinkhorn(nn.Module):
@@ -1390,7 +1477,7 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 #             return loss / B
 
 #     model = MatchingModel().to(device)
-#     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+#     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
 #     # training rapido con early stopping
 #     best_val = float('inf')
@@ -1461,7 +1548,7 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 #     sinkhorn_max_iter=params["max_iter"]
 # ).to(device)
 
-# optimizer = torch.optim.Adam(
+# optimizer = torch.optim.AdamW(
 #     model.parameters(),
 #     lr=params["lr"],
 #     weight_decay=params["weight_decay"]
@@ -2418,7 +2505,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# Logger TensorBoard
+writer = setup_tb_logger(
+    base_dir="tb_logs",
+    model_name=model._get_name(),
+    dataset_name="GM_equal",
+    experiment_name="exp1"
+)
 
 #model summary
 print(model)
@@ -2431,6 +2526,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
+    writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
@@ -2539,7 +2635,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# Logger TensorBoard
+writer = setup_tb_logger(
+    base_dir="tb_logs",
+    model_name=model._get_name(),
+    dataset_name="GM_local",
+    experiment_name="exp1"
+)
 
 #model summary
 print(model)
@@ -2552,6 +2656,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
+    writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
@@ -2661,7 +2766,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# Logger TensorBoard
+writer = setup_tb_logger(
+    base_dir="tb_logs",
+    model_name=model._get_name(),
+    dataset_name="GM_global",
+    experiment_name="exp1"
+)
 
 #model summary
 print(model)
@@ -2674,6 +2787,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
+    writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
@@ -2783,8 +2897,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
+# Logger TensorBoard
+writer = setup_tb_logger(
+    base_dir="tb_logs",
+    model_name=model._get_name(),
+    dataset_name="GM_global_local",
+    experiment_name="exp1"
+)
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
@@ -2796,6 +2917,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
+    writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
@@ -2909,7 +3031,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# Logger TensorBoard
+writer = setup_tb_logger(
+    base_dir="tb_logs",
+    model_name=model._get_name(),
+    dataset_name="PGM_ws_dropout_equal",
+    experiment_name="exp1"
+)
 
 #model summary
 print(model)
@@ -2922,6 +3052,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
+    writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
@@ -3032,7 +3163,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# Logger TensorBoard
+writer = setup_tb_logger(
+    base_dir="tb_logs",
+    model_name=model._get_name(),
+    dataset_name="PGM_ws_dropout_noise",
+    experiment_name="exp1"
+)
 
 #model summary
 print(model)
@@ -3045,6 +3184,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
+    writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
@@ -3155,7 +3295,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# Logger TensorBoard
+writer = setup_tb_logger(
+    base_dir="tb_logs",
+    model_name=model._get_name(),
+    dataset_name="PGM_room_dropout_equal",
+    experiment_name="exp1"
+)
 
 #model summary
 print(model)
@@ -3168,6 +3316,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
+    writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
@@ -3278,7 +3427,15 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
+# Logger TensorBoard
+writer = setup_tb_logger(
+    base_dir="tb_logs",
+    model_name=model._get_name(),
+    dataset_name="PGM_room_dropout_noise",
+    experiment_name="exp1"
+)
 
 #model summary
 print(model)
@@ -3291,6 +3448,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     train_loader=train_loader,
     val_loader=val_loader,
     num_epochs=num_epochs,
+    writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
