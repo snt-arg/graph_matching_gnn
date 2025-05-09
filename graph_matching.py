@@ -1185,6 +1185,7 @@ num_epochs = 100
 learning_rate = 1e-3
 batch_size = 16
 weight_decay = 1e-5
+patience = 15
 
 ###     GRAPH MATCHING MODEL
 class MatchingModel_GATv2Sinkhorn(nn.Module):
@@ -2411,12 +2412,6 @@ test_dataset = GraphMatchingDataset(test_list)
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
 
-# Early stopping
-best_val_loss = float('inf')
-patience = 10
-patience_counter = 0
-best_epoch = -1
-
 # Loader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
@@ -2537,12 +2532,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Early stopping
-best_val_loss = float('inf')
-patience = 10
-patience_counter = 0
-best_epoch = -1
 
 # Loader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
@@ -2666,12 +2655,6 @@ test_dataset = GraphMatchingDataset(test_list)
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
 
-# Early stopping
-best_val_loss = float('inf')
-patience = 10
-patience_counter = 0
-best_epoch = -1
-
 # Loader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
@@ -2793,12 +2776,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Early stopping
-best_val_loss = float('inf')
-patience = 10
-patience_counter = 0
-best_epoch = -1
 
 # Loader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
@@ -2926,12 +2903,6 @@ test_dataset = GraphMatchingDataset(test_list)
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
 
-# Early stopping
-best_val_loss = float('inf')
-patience = 10
-patience_counter = 0
-best_epoch = -1
-
 # Loader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
@@ -3054,12 +3025,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Early stopping
-best_val_loss = float('inf')
-patience = 10
-patience_counter = 0
-best_epoch = -1
 
 # Loader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
@@ -3184,12 +3149,6 @@ test_dataset = GraphMatchingDataset(test_list)
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
 
-# Early stopping
-best_val_loss = float('inf')
-patience = 10
-patience_counter = 0
-best_epoch = -1
-
 # Loader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
@@ -3312,12 +3271,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Early stopping
-best_val_loss = float('inf')
-patience = 10
-patience_counter = 0
-best_epoch = -1
 
 # Loader
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
