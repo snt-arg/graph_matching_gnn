@@ -6,3 +6,4 @@ GNN/
 GNN.zip
 slurm*
 preamble.py
+tb_logs/
