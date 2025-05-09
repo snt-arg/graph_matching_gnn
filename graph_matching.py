@@ -388,14 +388,74 @@ def nx_to_pyg_data_preserve_order(graph: nx.DiGraph) -> Data:
     data.permutation = torch.arange(len(node_ids), dtype=torch.long)
     return data
 
+def split_graphs_stratified(
+    pairs: List[Tuple[Data, Data, torch.Tensor]],
+    train_frac: float = 0.7,
+    val_frac: float   = 0.15,
+    test_frac: float  = 0.15,
+    n_bins: int       = 5,
+    seed: int         = seed
+) -> Tuple[
+    List[Tuple[Data,Data,torch.Tensor]],
+    List[Tuple[Data,Data,torch.Tensor]],
+    List[Tuple[Data,Data,torch.Tensor]]
+]:
+    """
+    Stratified split of graph-matching pairs into train/val/test.
+    Puoi specificare le frazioni (devono sommarsi a 1.0).
+    Stratifica sulla dimensione di g2 (num_nodes).
 
-def split_graphs(graphs, seed: int = 42):
+    Args:
+        pairs: lista di tuple (g1, g2, P)
+        train_frac, val_frac, test_frac: frazioni per i tre set (somma = 1.0)
+        n_bins: numero di fasce per la stratificazione
+        seed: random seed
+
+    Returns:
+        train, val, test  —  tre liste di coppie
     """
-    Split graphs into 70% train, 15% validation, 15% test.
-    """
-    train, temp = train_test_split(graphs, test_size=0.3, random_state=seed)
-    val, test = train_test_split(temp, test_size=0.5, random_state=seed)
+    # verifica che le frazioni sommino a 1
+    total = train_frac + val_frac + test_frac
+    assert abs(total - 1.0) < 1e-6, "train_frac+val_frac+test_frac must sum to 1.0"
+
+    # 1) calcola size per ciascuna coppia (numero nodi in g2)
+    sizes = np.array([g2.num_nodes for g1, g2, P in pairs])
+
+    # 2) crea bin di equal‑width su [min, max]
+    bins = np.linspace(sizes.min(), sizes.max()+1, n_bins+1)
+    size_bins = np.digitize(sizes, bins) - 1  # etichette 0…n_bins-1
+
+    # 3) primo split: train vs temp
+    train_idx, temp_idx = train_test_split(
+        np.arange(len(pairs)),
+        test_size=(1.0 - train_frac),
+        random_state=seed,
+        stratify=size_bins
+    )
+
+    # 4) split del residuo temp in val/test
+    #    la frazione di temp da destinare a val è val_frac/(val_frac+test_frac)
+    rel_val_frac = val_frac / (val_frac + test_frac)
+    temp_bins = size_bins[temp_idx]
+    val_idx, test_idx = train_test_split(
+        temp_idx,
+        test_size=(1.0 - rel_val_frac),
+        random_state=seed,
+        stratify=temp_bins
+    )
+
+    # 5) costruisci le liste effettive
+    train = [pairs[i] for i in train_idx]
+    val   = [pairs[i] for i in val_idx]
+    test  = [pairs[i] for i in test_idx]
+
     return train, val, test
+
+
+# Controllo rapido delle distribuzioni
+def describe(split, name):
+    sz = [g1.num_nodes for g1, _, _ in split]
+    print(f"{name}: count={len(split)}, nodes min={min(sz)}, max={max(sz)}, mean={np.mean(sz):.1f}")
 
 
 def generate_matching_pair_as_data(
@@ -968,14 +1028,15 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
 #            MODELS
 #----------------------------------------
 
+# SG-pgm model adaptation
 # class MatchingModel_GATv2SinkhornTopK(nn.Module):
 #     def __init__(
 #         self,
 #         in_dim: int,
 #         hidden_dim: int,
 #         out_dim: int,
-#         sinkhorn_max_iter: int = 10,
-#         sinkhorn_tau: float = 1.0,
+#         sinkhorn_max_iter: int = 20,
+#         sinkhorn_tau: float = 5e-2,
 #     ):
 #         super().__init__()
 #         # ─── 1) GNN backbone: two-layer GATv2
@@ -1116,9 +1177,18 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
 
 #         return perm_pred_list, all_embeddings
 
+# Iperparametri
+in_dim = 7
+hidden_dim = 64
+out_dim = 32
+num_epochs = 100
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-5
+
 ###     GRAPH MATCHING MODEL
 class MatchingModel_GATv2Sinkhorn(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, attention_dropout=0.2, dropout_emb=0.3):
+    def __init__(self, in_dim, hidden_dim, out_dim, attention_dropout=0.1, dropout_emb=0.2):
         super().__init__()
         self.gnn = nn.ModuleList([
             GATv2Conv(in_dim, hidden_dim, dropout=attention_dropout),
@@ -1177,8 +1247,8 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         out_dim: int,
         sinkhorn_max_iter: int = 15,
         sinkhorn_tau: float = 0.1,
-        attention_dropout: float = 0.2,
-        dropout_emb: float = 0.3
+        attention_dropout: float = 0.1,
+        dropout_emb: float = 0.2
     ):
         super().__init__()
         self.gnn = nn.ModuleList([
@@ -1502,14 +1572,15 @@ def make_random_graph(name, n_nodes=5, p_edge=0.4):
 graphs = [make_random_graph(f'G{i}') for i in range(6)]
 print("Total graphs generated:", len(graphs))
 
-# 2) Split 70/15/15
-train, val, test = split_graphs(graphs, seed=42)
-print("Split sizes → train:", len(train), "val:", len(val), "test:", len(test))
-assert len(train)==4 and len(val)==1 and len(test)==1, "Split not conforming"
-
 # 3) Test full matching (g0 vs g0 itself)
 pairs_full = []
 generate_matching_pair_as_data(graphs[0], graphs[0], pairs_full)
+
+# # 3.1) Split 70/15/15 
+# train, val, test = split_graphs_stratified(pairs_full, train_frac=0.6, val_frac=0.2, test_frac=0.2)
+# print("Split sizes → train:", len(train), "val:", len(val), "test:", len(test))
+# assert len(train)==4 and len(val)==1 and len(test)==1, "Split not conforming"
+
 pyg1_f, pyg2_f, P_full = pairs_full[0]
 n = len(graphs[0].nodes())
 print("Full match shape:", P_full.shape)
@@ -1645,7 +1716,11 @@ pair_gt_list = []
 for i, g1 in enumerate(original_graphs):
     generate_matching_pair_as_data(g1, g1, pair_gt_list)
 
-train, val, test = split_graphs(pair_gt_list)
+train, val, test = split_graphs_stratified(pair_gt_list)
+
+describe(train, "TRAIN")
+describe(val,   "VAL")
+describe(test,  "TEST")
 
 # compute mean and std
 mean, std = compute_mean_std(train)
@@ -1723,7 +1798,11 @@ pair_gt_list = []
 for i, g1 in enumerate(original_graphs):
     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
 
-train, val, test = split_graphs(pair_gt_list)
+train, val, test = split_graphs_stratified(pair_gt_list)
+
+describe(train, "TRAIN")
+describe(val,   "VAL")
+describe(test,  "TEST")
 
 # compute mean and std
 mean, std = compute_mean_std(train)
@@ -1802,7 +1881,11 @@ pair_gt_list = []
 for i, g1 in enumerate(original_graphs):
     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
 
-train, val, test = split_graphs(pair_gt_list)
+train, val, test = split_graphs_stratified(pair_gt_list)
+
+describe(train, "TRAIN")
+describe(val,   "VAL")
+describe(test,  "TEST")
 
 # compute mean and std
 mean, std = compute_mean_std(train)
@@ -1881,7 +1964,11 @@ pair_gt_list = []
 for i, g1 in enumerate(original_graphs):
     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
 
-train, val, test = split_graphs(pair_gt_list)
+train, val, test = split_graphs_stratified(pair_gt_list)
+
+describe(train, "TRAIN")
+describe(val,   "VAL")
+describe(test,  "TEST")
 
 # compute mean and std
 mean, std = compute_mean_std(train)
@@ -1966,7 +2053,11 @@ pair_gt_list = []
 for i, g1 in enumerate(original_graphs):
     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
 
-train, val, test = split_graphs(pair_gt_list)
+train, val, test = split_graphs_stratified(pair_gt_list)
+
+describe(train, "TRAIN")
+describe(val,   "VAL")
+describe(test,  "TEST")
 
 # compute mean and std
 mean, std = compute_mean_std(train)
@@ -2047,7 +2138,11 @@ pair_gt_list = []
 for i, g1 in enumerate(original_graphs):
     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
 
-train, val, test = split_graphs(pair_gt_list)
+train, val, test = split_graphs_stratified(pair_gt_list)
+
+describe(train, "TRAIN")
+describe(val,   "VAL")
+describe(test,  "TEST")
 
 # compute mean and std
 mean, std = compute_mean_std(train)
@@ -2128,7 +2223,11 @@ pair_gt_list = []
 for i, g1 in enumerate(original_graphs):
     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
 
-train, val, test = split_graphs(pair_gt_list)
+train, val, test = split_graphs_stratified(pair_gt_list)
+
+describe(train, "TRAIN")
+describe(val,   "VAL")
+describe(test,  "TEST")
 
 # compute mean and std
 mean, std = compute_mean_std(train)
@@ -2209,7 +2308,11 @@ pair_gt_list = []
 for i, g1 in enumerate(original_graphs):
     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
 
-train, val, test = split_graphs(pair_gt_list)
+train, val, test = split_graphs_stratified(pair_gt_list)
+
+describe(train, "TRAIN")
+describe(val,   "VAL")
+describe(test,  "TEST")
 
 # compute mean and std
 mean, std = compute_mean_std(train)
@@ -2307,15 +2410,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Iperparametri
-in_dim = 7
-hidden_dim = 64
-out_dim = 32
-num_epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -2443,15 +2537,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Iperparametri
-in_dim = 7
-hidden_dim = 64
-out_dim = 32
-num_epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -2581,15 +2666,6 @@ test_dataset = GraphMatchingDataset(test_list)
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
 
-# Iperparametri
-in_dim = 7
-hidden_dim = 64
-out_dim = 32
-num_epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-weight_decay = 1e-4
-
 # Early stopping
 best_val_loss = float('inf')
 patience = 10
@@ -2717,15 +2793,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Iperparametri
-in_dim = 7
-hidden_dim = 64
-out_dim = 32
-num_epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -2859,15 +2926,6 @@ test_dataset = GraphMatchingDataset(test_list)
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
 
-# Iperparametri
-in_dim = 7
-hidden_dim = 64
-out_dim = 32
-num_epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-weight_decay = 1e-4
-
 # Early stopping
 best_val_loss = float('inf')
 patience = 10
@@ -2996,15 +3054,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Iperparametri
-in_dim = 7
-hidden_dim = 64
-out_dim = 32
-num_epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -3135,15 +3184,6 @@ test_dataset = GraphMatchingDataset(test_list)
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
 
-# Iperparametri
-in_dim = 7
-hidden_dim = 64
-out_dim = 32
-num_epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-weight_decay = 1e-4
-
 # Early stopping
 best_val_loss = float('inf')
 patience = 10
@@ -3272,15 +3312,6 @@ test_dataset = GraphMatchingDataset(test_list)
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
-
-# Iperparametri
-in_dim = 7
-hidden_dim = 64
-out_dim = 32
-num_epochs = 100
-learning_rate = 1e-3
-batch_size = 16
-weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
