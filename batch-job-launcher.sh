@@ -1,5 +1,5 @@
 #!/bin/bash -l
-#SBATCH -c 2
+#SBATCH -c 7
 #SBATCH --time=0-08:00:00
 #SBATCH -p gpu
 #SBATCH --gres=gpu:volta:1

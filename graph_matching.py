@@ -42,6 +42,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 # ─── Standard library ──────────────────────────────────────────────────────────
 import copy
 import os
+import sys
 import pickle
 import random
 import time
@@ -72,6 +73,16 @@ import optuna
 
 import pygmtools
 pygmtools.BACKEND = 'pytorch'
+
+destination_dir = os.path.join('AFAT')
+
+# Ensure the destination directory is in sys.path
+if destination_dir not in sys.path:
+    sys.path.append(destination_dir)
+
+# AFA-U inlier predictor and Top-K matching from AFAT
+from k_pred_net import Encoder as AFAUEncoder
+from sinkhorn_topk import soft_topk
 
 # %%
 # Set Seed for reproducibility
@@ -678,7 +689,7 @@ def collate_pyg_matching(batch):
     
     return batch1, batch2, perm_list
 
-
+### OLD FUNCTION WITH BCE AND PLAIN ACCURACY
 # def train_epoch_sinkhorn(model, loader, optimizer):
 #     model.train()
 #     total_loss = 0
@@ -954,9 +965,447 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs,
     return train_losses, val_losses, val_embeddings_history
 
 #----------------------------------------
+#            MODELS
+#----------------------------------------
+
+# class MatchingModel_GATv2SinkhornTopK(nn.Module):
+#     def __init__(
+#         self,
+#         in_dim: int,
+#         hidden_dim: int,
+#         out_dim: int,
+#         sinkhorn_max_iter: int = 10,
+#         sinkhorn_tau: float = 1.0,
+#     ):
+#         super().__init__()
+#         # ─── 1) GNN backbone: two-layer GATv2
+#         # First GATv2Conv projects in_dim → hidden_dim, apply ReLU
+#         # Second GATv2Conv projects hidden_dim → out_dim, no activation afterwards
+#         self.gnn = nn.ModuleList([
+#             GATv2Conv(in_dim, hidden_dim),
+#             GATv2Conv(hidden_dim, out_dim),
+#         ])
+#         # InstanceNorm to normalize each [N1×N2] similarity map
+#         self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+
+#         # ─── 2) AFA-U “unified” module to predict number of inliers K
+#         #  univ_size = maximum graph size, used to pad all embeddings to fixed length
+#         self.k_top_encoder = AFAUEncoder()
+
+#         # Two small MLPs to reduce pooled embedding → scalar in [0,1]
+#         self.final_row = nn.Sequential(
+#             nn.Linear(out_dim, 8),
+#             nn.ReLU(),
+#             nn.Linear(8, 1),
+#             nn.Sigmoid()
+#         )
+#         self.final_col = nn.Sequential(
+#             nn.Linear(out_dim, 8),
+#             nn.ReLU(),
+#             nn.Linear(8, 1),
+#             nn.Sigmoid()
+#         )
+
+#         # Sinkhorn-TopK hyperparams
+#         self.sinkhorn_max_iter = sinkhorn_max_iter
+#         self.sinkhorn_tau      = sinkhorn_tau
+
+#     def encode(self, x, edge_index):
+#         """
+#         Pass input features x through the two GATv2Conv layers.
+#         Apply ReLU after the first, but not after the last.
+#         """
+#         for i, conv in enumerate(self.gnn):
+#             x = conv(x, edge_index)
+#             if i < len(self.gnn) - 1:
+#                 x = F.relu(x)
+#         return x
+
+#     def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+#         """
+#         batch1, batch2: PyG Data objects for the two graphs in each pair.
+#         batch_idx1, batch_idx2: optional precomputed batch assignments.
+#         Returns a list of final hard match matrices (perm_pred_list) and
+#         the raw embeddings for each graph pair (all_embeddings).
+#         """
+#         # device = next(self.parameters()).device
+
+#         # ─── 1) Unpack node features & edge indices, move to GPU/CPU
+#         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+#         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+
+#         # ─── 2) Determine which node belongs to which graph in the batch
+#         #    If not supplied, read from Data.batch
+#         batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+#         batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
+
+#         # ─── 3) Encode both sets of nodes via the GNN
+#         h1 = self.encode(x1, edge1)  # [total_nodes1, out_dim]
+#         h2 = self.encode(x2, edge2)  # [total_nodes2, out_dim]
+
+#         # How many graph pairs in this minibatch?
+#         B = batch_idx1.max().item() + 1
+
+#         perm_pred_list = []
+#         all_embeddings = []
+
+#         for b in range(B):
+#             # Isolate embeddings for the b-th graph pair
+#             h1_i = h1[batch_idx1 == b]  # shape [N1, d]
+#             h2_i = h2[batch_idx2 == b]  # shape [N2, d]
+#             N1, N2 = h1_i.size(0), h2_i.size(0)
+
+#             # ─── 4) Compute raw similarity: dot product between all node pairs
+#             sim = torch.matmul(h1_i, h2_i.T)    # [N1, N2]
+#             # Normalize per-instance so Sinkhorn is stable
+#             sim_b = sim.unsqueeze(0).unsqueeze(1)   # [1,1,N1,N2]
+#             sim_n = self.inst_norm(sim_b).squeeze(1)  # [1,N1,N2]
+
+#             # Prepare row/col sizes for pygmtools
+#             n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
+#             n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
+
+#             # Soft Sinkhorn → soft_match [N1,N2]
+#             soft_S = pygmtools.sinkhorn(sim_n, n1=n1_t, n2=n2_t, dummy_row=False)[0]
+
+#             # ─── 5) AFA-U predicts inlier count K from soft matching
+#             #   a) Expand dims to batch form
+#             row_emb = h1_i.unsqueeze(0)      # [1, N1, d]
+#             col_emb = h2_i.unsqueeze(0)      # [1, N2, d]
+#             cost_mat = sim_n                 # [1, N1, N2]
+
+#             #   b) Run the bipartite-attention encoder
+#             out_r, out_c = self.k_top_encoder(row_emb, col_emb, cost_mat) # [1, N1, d], [1, N2, d]
+            
+#             #   c) Dynamic max over nodes
+#             g_r = out_r.max(dim=1).values     # [1, d]
+#             g_c = out_c.max(dim=1).values     # [1, d]
+
+#             #   d) Small MLPs → fraction in [0,1]
+#             k_r = self.final_row(g_r).squeeze(-1)  # [1]
+#             k_c = self.final_col(g_c).squeeze(-1)  # [1]
+#             ks  = (k_r + k_c) / 2                  # [1] average of row/col predictions
+
+#             # ─── 6) Top-K matching
+
+#             if self.training:
+#                 # use ground-truth K
+#                 ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
+#                 hard_S, soft_S = soft_topk(
+#                     sim_n, ks_gt,
+#                     max_iter=self.sinkhorn_max_iter,
+#                     tau=self.sinkhorn_tau,
+#                     nrows=n1_t, ncols=n2_t,
+#                     return_prob=True
+#                 )
+#                 perm_pred_list.append(soft_S[0])
+#             else:
+#                 ks_eff = (ks * N2).long()
+#                 hard_S = soft_topk(
+#                     sim_n, ks_eff,
+#                     max_iter=self.sinkhorn_max_iter,
+#                     tau=self.sinkhorn_tau,
+#                     nrows=n1_t, ncols=n2_t,
+#                     return_prob=False
+#                 )
+#                 perm_pred_list.append(hard_S[0])
+
+
+#             # ─── 7) Collect outputs for this pair
+#             all_embeddings.append((h1_i, h2_i))   # store embeddings for any downstream use
+
+#         return perm_pred_list, all_embeddings
+
+###     GRAPH MATCHING MODEL
+class MatchingModel_GATv2Sinkhorn(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, attention_dropout=0.2, dropout_emb=0.3):
+        super().__init__()
+        self.gnn = nn.ModuleList([
+            GATv2Conv(in_dim, hidden_dim, dropout=attention_dropout),
+            GATv2Conv(hidden_dim, out_dim, dropout=attention_dropout)
+        ])
+        self.dropout = nn.Dropout(p=dropout_emb)
+        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+
+    def encode(self, x, edge_index):
+        for i, conv in enumerate(self.gnn):
+            x = conv(x, edge_index)
+            if i < len(self.gnn) - 1:
+                x = F.relu(x)
+                x = self.dropout(x)
+        return x
+
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+        device = next(self.parameters()).device
+
+        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+
+        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
+
+        h1 = self.encode(x1, edge1)
+        h2 = self.encode(x2, edge2)
+
+        B = batch_idx1.max().item() + 1
+        perm_pred_list = []
+        all_embeddings = []
+
+        for i in range(B):
+            h1_i = h1[batch_idx1 == i]
+            h2_i = h2[batch_idx2 == i]
+
+            sim = torch.matmul(h1_i, h2_i.T)
+            sim_batched = sim.unsqueeze(0).unsqueeze(1)
+            sim_normed = self.inst_norm(sim_batched).squeeze(1)
+
+            n1 = torch.tensor([h1_i.size(0)], dtype=torch.int32, device=device)
+            n2 = torch.tensor([h2_i.size(0)], dtype=torch.int32, device=device)
+
+            S = pygmtools.sinkhorn(sim_normed, n1=n1, n2=n2, dummy_row=False)[0]
+            perm_pred_list.append(S)
+            all_embeddings.append((h1_i, h2_i))
+
+        return perm_pred_list, all_embeddings
+
+###     PARTIAL GRAPH MATCHING MODEL
+class MatchingModel_GATv2SinkhornTopK(nn.Module):
+    def __init__(
+        self,
+        in_dim: int,
+        hidden_dim: int,
+        out_dim: int,
+        sinkhorn_max_iter: int = 10,
+        sinkhorn_tau: float = 1.0,
+        attention_dropout: float = 0.2,
+        dropout_emb: float = 0.3
+    ):
+        super().__init__()
+        self.gnn = nn.ModuleList([
+            GATv2Conv(in_dim, hidden_dim, dropout=attention_dropout),
+            GATv2Conv(hidden_dim, out_dim, dropout=attention_dropout),
+        ])
+        self.dropout = nn.Dropout(p=dropout_emb)
+        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+
+        self.sinkhorn_max_iter = sinkhorn_max_iter
+        self.sinkhorn_tau = sinkhorn_tau
+
+    def encode(self, x, edge_index):
+        for i, conv in enumerate(self.gnn):
+            x = conv(x, edge_index)
+            if i < len(self.gnn) - 1:
+                x = F.relu(x)
+                x = self.dropout(x)
+        return x
+
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+        device = next(self.parameters()).device
+
+        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+
+        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
+
+        h1 = self.encode(x1, edge1)
+        h2 = self.encode(x2, edge2)
+
+        B = batch_idx1.max().item() + 1
+        perm_pred_list = []
+        all_embeddings = []
+
+        for b in range(B):
+            h1_i = h1[batch_idx1 == b]
+            h2_i = h2[batch_idx2 == b]
+            N1, N2 = h1_i.size(0), h2_i.size(0)
+
+            sim = torch.matmul(h1_i, h2_i.T)
+            sim_b = sim.unsqueeze(0).unsqueeze(1)
+            sim_n = self.inst_norm(sim_b).squeeze(1)
+
+            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
+            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
+
+            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
+            hard_S, soft_S = soft_topk(
+                sim_n, ks_gt,
+                max_iter=self.sinkhorn_max_iter,
+                tau=self.sinkhorn_tau,
+                nrows=n1_t, ncols=n2_t,
+                return_prob=True
+            )
+
+            if self.training:
+                perm_pred_list.append(soft_S[0])
+            else:
+                perm_pred_list.append(hard_S[0])
+
+            all_embeddings.append((h1_i, h2_i))
+
+        return perm_pred_list, all_embeddings
+
+#----------------------------------------
 #            PARAMETERS OPTIMIZATION
 #----------------------------------------
 
+# ----------------------------------------
+# 1) Script di ottimizzazione con Optuna
+# ----------------------------------------
+
+# def objective(trial):
+#     # iperparametri da esplorare
+#     lr           = trial.suggest_loguniform("lr", 1e-4, 1e-2)
+#     weight_decay = trial.suggest_loguniform("weight_decay", 1e-6, 1e-3)
+#     dropout      = trial.suggest_uniform("dropout", 0.0, 0.6)
+#     hidden_dim   = trial.suggest_categorical("hidden_dim", [32, 64, 128])
+#     out_dim      = trial.suggest_categorical("out_dim",    [16, 32, 64])
+#     batch_size   = trial.suggest_categorical("batch_size", [2, 4, 8])
+#     heads        = trial.suggest_int("heads",           1,   4)
+#     attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
+#     num_layers   = trial.suggest_int("num_layers",       1,   3)
+#     sinkhorn_tau = trial.suggest_loguniform("tau",      1e-3, 1e-1)
+#     max_iter     = trial.suggest_int("max_iter",        10, 100)
+
+#     # dataloader
+#     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching)
+#     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+
+#     # modello
+#     class MatchingModel(nn.Module):
+#         def __init__(self):
+#             super().__init__()
+#             layers = []
+#             dims = [train_dataset.num_node_features] + [hidden_dim] * (num_layers-1) + [out_dim]
+#             for i in range(num_layers):
+#                 layers.append(
+#                     GATv2Conv(dims[i], dims[i+1], heads=heads,
+#                               dropout=attn_dropout, negative_slope=0.2)
+#                 )
+#             self.gnn = nn.ModuleList(layers)
+#             self.dropout = dropout
+#             self.inst_norm = InstanceNorm2d(1, affine=True)
+#             self.tau = sinkhorn_tau
+#             self.max_iter = max_iter
+
+#         def encode(self, x, edge_index):
+#             for i, conv in enumerate(self.gnn):
+#                 x = conv(x, edge_index)
+#                 if i < len(self.gnn)-1:
+#                     x = F.relu(x)
+#                     x = F.dropout(x, p=self.dropout, training=self.training)
+#             return x
+
+#         def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+#             device = next(self.parameters()).device
+#             x1, e1 = batch1.x.to(device), batch1.edge_index.to(device)
+#             x2, e2 = batch2.x.to(device), batch2.edge_index.to(device)
+#             if batch_idx1 is None:
+#                 batch_idx1 = batch1.batch.to(device)
+#                 batch_idx2 = batch2.batch.to(device)
+#             h1 = self.encode(x1, e1)
+#             h2 = self.encode(x2, e2)
+#             B = batch_idx1.max().item()+1
+#             loss = 0
+#             for b in range(B):
+#                 h1_b = h1[batch_idx1==b]
+#                 h2_b = h2[batch_idx2==b]
+#                 sim = torch.matmul(h1_b, h2_b.T).unsqueeze(0).unsqueeze(1)
+#                 sim_n = self.inst_norm(sim).squeeze(1)
+#                 n1 = torch.tensor([h1_b.size(0)], dtype=torch.int32, device=device)
+#                 n2 = torch.tensor([h2_b.size(0)], dtype=torch.int32, device=device)
+#                 S = pygmtools.sinkhorn(sim_n, n1=n1, n2=n2, dummy_row=False,
+#                                        tau=self.tau, max_iter=self.max_iter)[0]
+#                 loss = loss + loss_fn(S, batch2.perm_gt_list[b])
+#             return loss / B
+
+#     model = MatchingModel().to(device)
+#     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+#     # training rapido con early stopping
+#     best_val = float('inf')
+#     counter = 0
+#     for epoch in range(30):
+#         # train
+#         model.train()
+#         for b1, b2, _ in train_loader:
+#             optimizer.zero_grad()
+#             loss = model(b1, b2)
+#             loss.backward()
+#             optimizer.step()
+#         # validate
+#         model.eval()
+#         val_loss = 0
+#         with torch.no_grad():
+#             for b1, b2, _ in val_loader:
+#                 val_loss += model(b1, b2).item()
+#         val_loss /= len(val_loader)
+#         trial.report(val_loss, epoch)
+#         if trial.should_prune():
+#             raise optuna.TrialPruned()
+#         if val_loss < best_val:
+#             best_val = val_loss
+#             counter = 0
+#         else:
+#             counter += 1
+#             if counter >= 5:
+#                 break
+
+#     return best_val
+
+# if __name__ == "__main__":
+#     study = optuna.create_study(direction="minimize")
+#     study.optimize(objective, n_trials=30)
+#     best = study.best_trial
+#     print("Best trial:", best.value)
+#     print(best.params)
+#     with open("best_hparams.json", "w") as f:
+#         json.dump(best.params, f, indent=2)
+#     print("Saved best_hparams.json")
+
+
+# ----------------------------------------
+# 2) Script di training finale
+# ----------------------------------------
+
+# # Carica i migliori iperparametri
+# with open("best_hparams.json") as f:
+#     params = json.load(f)
+
+# # Dataloader
+# train_loader = DataLoader(train_dataset, batch_size=params["batch_size"], shuffle=True, collate_fn=collate_pyg_matching)
+# val_loader   = DataLoader(val_dataset,   batch_size=params["batch_size"], shuffle=False, collate_fn=collate_pyg_matching)
+# test_loader  = DataLoader(test_dataset,  batch_size=params["batch_size"], shuffle=False, collate_fn=collate_pyg_matching)
+
+# # Modello come sopra
+# model = MatchingModel(
+#     in_dim=train_dataset.num_node_features,
+#     hidden_dim=params["hidden_dim"],
+#     out_dim=params["out_dim"],
+#     dropout=params["dropout"],
+#     heads=params["heads"],
+#     attn_dropout=params["attn_dropout"],
+#     neg_slope=0.2,
+#     num_layers=params["num_layers"],
+#     sinkhorn_tau=params["tau"],
+#     sinkhorn_max_iter=params["max_iter"]
+# ).to(device)
+
+# optimizer = torch.optim.Adam(
+#     model.parameters(),
+#     lr=params["lr"],
+#     weight_decay=params["weight_decay"]
+# )
+
+# # Training completo
+# train_losses, val_losses, _ = train_loop(
+#     model, optimizer,
+#     train_loader, val_loader,
+#     num_epochs=100,
+#     patience=10
+# )
+
+# Plot delle loss\ nplot_losses(train_losses, val_losses, output_path="losses.png")
 
 #----------------------------------------
 #            XAI UTILS
@@ -1855,60 +2304,6 @@ val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
 # %%
-class MatchingModel_GATv2Sinkhorn(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim):
-        super().__init__()
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim),
-            GATv2Conv(hidden_dim, out_dim)
-        ])
-        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-
-    def encode(self, x, edge_index):
-        for i, conv in enumerate(self.gnn):
-            x = conv(x, edge_index)
-            if i < len(self.gnn) - 1:
-                x = F.relu(x)
-        return x
-
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-        device = next(self.parameters()).device
-    
-        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-    
-        # Use existing batch indices if provided, otherwise extract from Data object
-        if batch_idx1 is None:
-            batch_idx1 = batch1.batch.to(device)
-        if batch_idx2 is None:
-            batch_idx2 = batch2.batch.to(device)
-    
-        h1 = self.encode(x1, edge1)
-        h2 = self.encode(x2, edge2)
-    
-        B = batch_idx1.max().item() + 1 if batch_idx1 is not None else 1
-        perm_pred_list = []
-        all_embeddings = []
-    
-        for i in range(B):
-            h1_i = h1[batch_idx1 == i]
-            h2_i = h2[batch_idx2 == i]
-    
-            sim = torch.matmul(h1_i, h2_i.T)  # [N1, N2]
-            sim_batched = sim.unsqueeze(0).unsqueeze(1)  # [1, 1, N1, N2]
-            sim_normed = self.inst_norm(sim_batched).squeeze(1)  # [1, N1, N2]
-    
-            n1 = torch.tensor([h1_i.size(0)], dtype=torch.int32, device=device)
-            n2 = torch.tensor([h2_i.size(0)], dtype=torch.int32, device=device)
-    
-            S = pygmtools.sinkhorn(sim_normed, n1=n1, n2=n2, dummy_row=False)[0]
-            perm_pred_list.append(S)
-            all_embeddings.append((h1_i, h2_i))
-    
-        return perm_pred_list, all_embeddings
-
-
-# %%
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
@@ -1918,8 +2313,9 @@ in_dim = 7
 hidden_dim = 64
 out_dim = 32
 num_epochs = 100
-learning_rate = 0.001
-batch_size = 3
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -1934,7 +2330,7 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 #model summary
 print(model)
@@ -2044,60 +2440,6 @@ val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
 # %%
-class MatchingModel_GATv2Sinkhorn(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim):
-        super().__init__()
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim),
-            GATv2Conv(hidden_dim, out_dim)
-        ])
-        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-
-    def encode(self, x, edge_index):
-        for i, conv in enumerate(self.gnn):
-            x = conv(x, edge_index)
-            if i < len(self.gnn) - 1:
-                x = F.relu(x)
-        return x
-
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-        device = next(self.parameters()).device
-    
-        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-    
-        # Use existing batch indices if provided, otherwise extract from Data object
-        if batch_idx1 is None:
-            batch_idx1 = batch1.batch.to(device)
-        if batch_idx2 is None:
-            batch_idx2 = batch2.batch.to(device)
-    
-        h1 = self.encode(x1, edge1)
-        h2 = self.encode(x2, edge2)
-    
-        B = batch_idx1.max().item() + 1 if batch_idx1 is not None else 1
-        perm_pred_list = []
-        all_embeddings = []
-    
-        for i in range(B):
-            h1_i = h1[batch_idx1 == i]
-            h2_i = h2[batch_idx2 == i]
-    
-            sim = torch.matmul(h1_i, h2_i.T)  # [N1, N2]
-            sim_batched = sim.unsqueeze(0).unsqueeze(1)  # [1, 1, N1, N2]
-            sim_normed = self.inst_norm(sim_batched).squeeze(1)  # [1, N1, N2]
-    
-            n1 = torch.tensor([h1_i.size(0)], dtype=torch.int32, device=device)
-            n2 = torch.tensor([h2_i.size(0)], dtype=torch.int32, device=device)
-    
-            S = pygmtools.sinkhorn(sim_normed, n1=n1, n2=n2, dummy_row=False)[0]
-            perm_pred_list.append(S)
-            all_embeddings.append((h1_i, h2_i))
-    
-        return perm_pred_list, all_embeddings
-
-
-# %%
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
@@ -2107,8 +2449,9 @@ in_dim = 7
 hidden_dim = 64
 out_dim = 32
 num_epochs = 100
-learning_rate = 0.001
-batch_size = 3
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -2123,7 +2466,7 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 #model summary
 print(model)
@@ -2234,60 +2577,6 @@ val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
 # %%
-class MatchingModel_GATv2Sinkhorn(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim):
-        super().__init__()
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim),
-            GATv2Conv(hidden_dim, out_dim)
-        ])
-        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-
-    def encode(self, x, edge_index):
-        for i, conv in enumerate(self.gnn):
-            x = conv(x, edge_index)
-            if i < len(self.gnn) - 1:
-                x = F.relu(x)
-        return x
-
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-        device = next(self.parameters()).device
-    
-        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-    
-        # Use existing batch indices if provided, otherwise extract from Data object
-        if batch_idx1 is None:
-            batch_idx1 = batch1.batch.to(device)
-        if batch_idx2 is None:
-            batch_idx2 = batch2.batch.to(device)
-    
-        h1 = self.encode(x1, edge1)
-        h2 = self.encode(x2, edge2)
-    
-        B = batch_idx1.max().item() + 1 if batch_idx1 is not None else 1
-        perm_pred_list = []
-        all_embeddings = []
-    
-        for i in range(B):
-            h1_i = h1[batch_idx1 == i]
-            h2_i = h2[batch_idx2 == i]
-    
-            sim = torch.matmul(h1_i, h2_i.T)  # [N1, N2]
-            sim_batched = sim.unsqueeze(0).unsqueeze(1)  # [1, 1, N1, N2]
-            sim_normed = self.inst_norm(sim_batched).squeeze(1)  # [1, N1, N2]
-    
-            n1 = torch.tensor([h1_i.size(0)], dtype=torch.int32, device=device)
-            n2 = torch.tensor([h2_i.size(0)], dtype=torch.int32, device=device)
-    
-            S = pygmtools.sinkhorn(sim_normed, n1=n1, n2=n2, dummy_row=False)[0]
-            perm_pred_list.append(S)
-            all_embeddings.append((h1_i, h2_i))
-    
-        return perm_pred_list, all_embeddings
-
-
-# %%
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
@@ -2297,8 +2586,9 @@ in_dim = 7
 hidden_dim = 64
 out_dim = 32
 num_epochs = 100
-learning_rate = 0.001
-batch_size = 3
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -2313,7 +2603,8 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
@@ -2423,60 +2714,6 @@ val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
 # %%
-class MatchingModel_GATv2Sinkhorn(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim):
-        super().__init__()
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim),
-            GATv2Conv(hidden_dim, out_dim)
-        ])
-        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-
-    def encode(self, x, edge_index):
-        for i, conv in enumerate(self.gnn):
-            x = conv(x, edge_index)
-            if i < len(self.gnn) - 1:
-                x = F.relu(x)
-        return x
-
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-        device = next(self.parameters()).device
-    
-        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-    
-        # Use existing batch indices if provided, otherwise extract from Data object
-        if batch_idx1 is None:
-            batch_idx1 = batch1.batch.to(device)
-        if batch_idx2 is None:
-            batch_idx2 = batch2.batch.to(device)
-    
-        h1 = self.encode(x1, edge1)
-        h2 = self.encode(x2, edge2)
-    
-        B = batch_idx1.max().item() + 1 if batch_idx1 is not None else 1
-        perm_pred_list = []
-        all_embeddings = []
-    
-        for i in range(B):
-            h1_i = h1[batch_idx1 == i]
-            h2_i = h2[batch_idx2 == i]
-    
-            sim = torch.matmul(h1_i, h2_i.T)  # [N1, N2]
-            sim_batched = sim.unsqueeze(0).unsqueeze(1)  # [1, 1, N1, N2]
-            sim_normed = self.inst_norm(sim_batched).squeeze(1)  # [1, N1, N2]
-    
-            n1 = torch.tensor([h1_i.size(0)], dtype=torch.int32, device=device)
-            n2 = torch.tensor([h2_i.size(0)], dtype=torch.int32, device=device)
-    
-            S = pygmtools.sinkhorn(sim_normed, n1=n1, n2=n2, dummy_row=False)[0]
-            perm_pred_list.append(S)
-            all_embeddings.append((h1_i, h2_i))
-    
-        return perm_pred_list, all_embeddings
-
-
-# %%
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
@@ -2486,8 +2723,9 @@ in_dim = 7
 hidden_dim = 64
 out_dim = 32
 num_epochs = 100
-learning_rate = 0.001
-batch_size = 3
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -2502,7 +2740,8 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
@@ -2572,18 +2811,6 @@ plot_two_graphs_with_matching(
 # # Partial graph matching
 
 # %% [markdown]
-# ## Import of AFA-U module and TopK from ThinkMatch
-
-# %%
-import sys
-import os
-destination_dir = os.path.join('AFAT')
-
-# Ensure the destination directory is in sys.path
-if destination_dir not in sys.path:
-    sys.path.append(destination_dir)
-
-# %% [markdown]
 # ## Ws dropout equal
 
 # %%
@@ -2628,160 +2855,6 @@ val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
 # %%
-# AFA-U inlier predictor and Top-K matching from AFAT
-from k_pred_net import Encoder as AFAUEncoder
-from sinkhorn_topk import soft_topk
-
-class MatchingModel_GATv2SinkhornTopK(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-        sinkhorn_max_iter: int = 10,
-        sinkhorn_tau: float = 1.0,
-    ):
-        super().__init__()
-        # ─── 1) GNN backbone: two-layer GATv2
-        # First GATv2Conv projects in_dim → hidden_dim, apply ReLU
-        # Second GATv2Conv projects hidden_dim → out_dim, no activation afterwards
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim),
-            GATv2Conv(hidden_dim, out_dim),
-        ])
-        # InstanceNorm to normalize each [N1×N2] similarity map
-        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-
-        # # ─── 2) AFA-U “unified” module to predict number of inliers K
-        # #  univ_size = maximum graph size, used to pad all embeddings to fixed length
-        # self.k_top_encoder = AFAUEncoder()
-
-        # # Two small MLPs to reduce pooled embedding → scalar in [0,1]
-        # self.final_row = nn.Sequential(
-        #     nn.Linear(out_dim, 8),
-        #     nn.ReLU(),
-        #     nn.Linear(8, 1),
-        #     nn.Sigmoid()
-        # )
-        # self.final_col = nn.Sequential(
-        #     nn.Linear(out_dim, 8),
-        #     nn.ReLU(),
-        #     nn.Linear(8, 1),
-        #     nn.Sigmoid()
-        # )
-
-        # Sinkhorn-TopK hyperparams
-        self.sinkhorn_max_iter = sinkhorn_max_iter
-        self.sinkhorn_tau      = sinkhorn_tau
-
-    def encode(self, x, edge_index):
-        """
-        Pass input features x through the two GATv2Conv layers.
-        Apply ReLU after the first, but not after the last.
-        """
-        for i, conv in enumerate(self.gnn):
-            x = conv(x, edge_index)
-            if i < len(self.gnn) - 1:
-                x = F.relu(x)
-        return x
-
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-        """
-        batch1, batch2: PyG Data objects for the two graphs in each pair.
-        batch_idx1, batch_idx2: optional precomputed batch assignments.
-        Returns a list of final hard match matrices (perm_pred_list) and
-        the raw embeddings for each graph pair (all_embeddings).
-        """
-        # device = next(self.parameters()).device
-
-        # ─── 1) Unpack node features & edge indices, move to GPU/CPU
-        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-
-        # ─── 2) Determine which node belongs to which graph in the batch
-        #    If not supplied, read from Data.batch
-        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
-        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-
-        # ─── 3) Encode both sets of nodes via the GNN
-        h1 = self.encode(x1, edge1)  # [total_nodes1, out_dim]
-        h2 = self.encode(x2, edge2)  # [total_nodes2, out_dim]
-
-        # How many graph pairs in this minibatch?
-        B = batch_idx1.max().item() + 1
-
-        perm_pred_list = []
-        all_embeddings = []
-
-        for b in range(B):
-            # Isolate embeddings for the b-th graph pair
-            h1_i = h1[batch_idx1 == b]  # shape [N1, d]
-            h2_i = h2[batch_idx2 == b]  # shape [N2, d]
-            N1, N2 = h1_i.size(0), h2_i.size(0)
-
-            # ─── 4) Compute raw similarity: dot product between all node pairs
-            sim = torch.matmul(h1_i, h2_i.T)    # [N1, N2]
-            # Normalize per-instance so Sinkhorn is stable
-            sim_b = sim.unsqueeze(0).unsqueeze(1)   # [1,1,N1,N2]
-            sim_n = self.inst_norm(sim_b).squeeze(1)  # [1,N1,N2]
-
-            # Prepare row/col sizes for pygmtools
-            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
-            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
-
-            # Soft Sinkhorn → soft_match [N1,N2]
-            # soft_S = pygmtools.sinkhorn(sim_n, n1=n1_t, n2=n2_t, dummy_row=False)[0]
-
-            # # ─── 5) AFA-U predicts inlier count K from soft matching
-            # #   a) Expand dims to batch form
-            # row_emb = h1_i.unsqueeze(0)      # [1, N1, d]
-            # col_emb = h2_i.unsqueeze(0)      # [1, N2, d]
-            # cost_mat = sim_n                 # [1, N1, N2]
-
-            # #   b) Run the bipartite-attention encoder
-            # out_r, out_c = self.k_top_encoder(row_emb, col_emb, cost_mat) # [1, N1, d], [1, N2, d]
-            
-            # #   c) Dynamic max over nodes
-            # g_r = out_r.max(dim=1).values     # [1, d]
-            # g_c = out_c.max(dim=1).values     # [1, d]
-
-            # #   d) Small MLPs → fraction in [0,1]
-            # k_r = self.final_row(g_r).squeeze(-1)  # [1]
-            # k_c = self.final_col(g_c).squeeze(-1)  # [1]
-            # ks  = (k_r + k_c) / 2                  # [1] average of row/col predictions
-
-            # ─── 6) Top-K matching
-
-            # use ground-truth K
-            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
-            hard_S, soft_S = soft_topk(
-                sim_n, ks_gt,
-                max_iter=self.sinkhorn_max_iter,
-                tau=self.sinkhorn_tau,
-                nrows=n1_t, ncols=n2_t,
-                return_prob=True
-            )
-
-            if self.training:
-                perm_pred_list.append(soft_S[0])
-            else:
-            #     ks_eff = (ks * N2).long()
-            #     hard_S = soft_topk(
-            #         sim_n, ks_eff,
-            #         max_iter=self.sinkhorn_max_iter,
-            #         tau=self.sinkhorn_tau,
-            #         nrows=n1_t, ncols=n2_t,
-            #         return_prob=False
-            #     )
-                perm_pred_list.append(hard_S[0])
-
-
-            # ─── 7) Collect outputs for this pair
-            all_embeddings.append((h1_i, h2_i))   # store embeddings for any downstream use
-
-        return perm_pred_list, all_embeddings
-
-# %%
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
@@ -2791,8 +2864,9 @@ in_dim = 7
 hidden_dim = 64
 out_dim = 32
 num_epochs = 100
-learning_rate = 0.001
-batch_size = 3
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -2806,8 +2880,9 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
@@ -2918,160 +2993,6 @@ val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
 # %%
-# AFA-U inlier predictor and Top-K matching from AFAT
-from k_pred_net import Encoder as AFAUEncoder
-from sinkhorn_topk import soft_topk
-
-class MatchingModel_GATv2SinkhornTopK(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-        sinkhorn_max_iter: int = 10,
-        sinkhorn_tau: float = 1.0,
-    ):
-        super().__init__()
-        # ─── 1) GNN backbone: two-layer GATv2
-        # First GATv2Conv projects in_dim → hidden_dim, apply ReLU
-        # Second GATv2Conv projects hidden_dim → out_dim, no activation afterwards
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim),
-            GATv2Conv(hidden_dim, out_dim),
-        ])
-        # InstanceNorm to normalize each [N1×N2] similarity map
-        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-
-        # # ─── 2) AFA-U “unified” module to predict number of inliers K
-        # #  univ_size = maximum graph size, used to pad all embeddings to fixed length
-        # self.k_top_encoder = AFAUEncoder()
-
-        # # Two small MLPs to reduce pooled embedding → scalar in [0,1]
-        # self.final_row = nn.Sequential(
-        #     nn.Linear(out_dim, 8),
-        #     nn.ReLU(),
-        #     nn.Linear(8, 1),
-        #     nn.Sigmoid()
-        # )
-        # self.final_col = nn.Sequential(
-        #     nn.Linear(out_dim, 8),
-        #     nn.ReLU(),
-        #     nn.Linear(8, 1),
-        #     nn.Sigmoid()
-        # )
-
-        # Sinkhorn-TopK hyperparams
-        self.sinkhorn_max_iter = sinkhorn_max_iter
-        self.sinkhorn_tau      = sinkhorn_tau
-
-    def encode(self, x, edge_index):
-        """
-        Pass input features x through the two GATv2Conv layers.
-        Apply ReLU after the first, but not after the last.
-        """
-        for i, conv in enumerate(self.gnn):
-            x = conv(x, edge_index)
-            if i < len(self.gnn) - 1:
-                x = F.relu(x)
-        return x
-
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-        """
-        batch1, batch2: PyG Data objects for the two graphs in each pair.
-        batch_idx1, batch_idx2: optional precomputed batch assignments.
-        Returns a list of final hard match matrices (perm_pred_list) and
-        the raw embeddings for each graph pair (all_embeddings).
-        """
-        # device = next(self.parameters()).device
-
-        # ─── 1) Unpack node features & edge indices, move to GPU/CPU
-        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-
-        # ─── 2) Determine which node belongs to which graph in the batch
-        #    If not supplied, read from Data.batch
-        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
-        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-
-        # ─── 3) Encode both sets of nodes via the GNN
-        h1 = self.encode(x1, edge1)  # [total_nodes1, out_dim]
-        h2 = self.encode(x2, edge2)  # [total_nodes2, out_dim]
-
-        # How many graph pairs in this minibatch?
-        B = batch_idx1.max().item() + 1
-
-        perm_pred_list = []
-        all_embeddings = []
-
-        for b in range(B):
-            # Isolate embeddings for the b-th graph pair
-            h1_i = h1[batch_idx1 == b]  # shape [N1, d]
-            h2_i = h2[batch_idx2 == b]  # shape [N2, d]
-            N1, N2 = h1_i.size(0), h2_i.size(0)
-
-            # ─── 4) Compute raw similarity: dot product between all node pairs
-            sim = torch.matmul(h1_i, h2_i.T)    # [N1, N2]
-            # Normalize per-instance so Sinkhorn is stable
-            sim_b = sim.unsqueeze(0).unsqueeze(1)   # [1,1,N1,N2]
-            sim_n = self.inst_norm(sim_b).squeeze(1)  # [1,N1,N2]
-
-            # Prepare row/col sizes for pygmtools
-            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
-            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
-
-            # Soft Sinkhorn → soft_match [N1,N2]
-            # soft_S = pygmtools.sinkhorn(sim_n, n1=n1_t, n2=n2_t, dummy_row=False)[0]
-
-            # # ─── 5) AFA-U predicts inlier count K from soft matching
-            # #   a) Expand dims to batch form
-            # row_emb = h1_i.unsqueeze(0)      # [1, N1, d]
-            # col_emb = h2_i.unsqueeze(0)      # [1, N2, d]
-            # cost_mat = sim_n                 # [1, N1, N2]
-
-            # #   b) Run the bipartite-attention encoder
-            # out_r, out_c = self.k_top_encoder(row_emb, col_emb, cost_mat) # [1, N1, d], [1, N2, d]
-            
-            # #   c) Dynamic max over nodes
-            # g_r = out_r.max(dim=1).values     # [1, d]
-            # g_c = out_c.max(dim=1).values     # [1, d]
-
-            # #   d) Small MLPs → fraction in [0,1]
-            # k_r = self.final_row(g_r).squeeze(-1)  # [1]
-            # k_c = self.final_col(g_c).squeeze(-1)  # [1]
-            # ks  = (k_r + k_c) / 2                  # [1] average of row/col predictions
-
-            # ─── 6) Top-K matching
-
-            # use ground-truth K
-            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
-            hard_S, soft_S = soft_topk(
-                sim_n, ks_gt,
-                max_iter=self.sinkhorn_max_iter,
-                tau=self.sinkhorn_tau,
-                nrows=n1_t, ncols=n2_t,
-                return_prob=True
-            )
-
-            if self.training:
-                perm_pred_list.append(soft_S[0])
-            else:
-            #     ks_eff = (ks * N2).long()
-            #     hard_S = soft_topk(
-            #         sim_n, ks_eff,
-            #         max_iter=self.sinkhorn_max_iter,
-            #         tau=self.sinkhorn_tau,
-            #         nrows=n1_t, ncols=n2_t,
-            #         return_prob=False
-            #     )
-                perm_pred_list.append(hard_S[0])
-
-
-            # ─── 7) Collect outputs for this pair
-            all_embeddings.append((h1_i, h2_i))   # store embeddings for any downstream use
-
-        return perm_pred_list, all_embeddings
-
-# %%
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
@@ -3081,8 +3002,9 @@ in_dim = 7
 hidden_dim = 64
 out_dim = 32
 num_epochs = 100
-learning_rate = 0.001
-batch_size = 3
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -3096,8 +3018,9 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
@@ -3208,160 +3131,6 @@ val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
 # %%
-# AFA-U inlier predictor and Top-K matching from AFAT
-from k_pred_net import Encoder as AFAUEncoder
-from sinkhorn_topk import soft_topk
-
-class MatchingModel_GATv2SinkhornTopK(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-        sinkhorn_max_iter: int = 10,
-        sinkhorn_tau: float = 1.0,
-    ):
-        super().__init__()
-        # ─── 1) GNN backbone: two-layer GATv2
-        # First GATv2Conv projects in_dim → hidden_dim, apply ReLU
-        # Second GATv2Conv projects hidden_dim → out_dim, no activation afterwards
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim),
-            GATv2Conv(hidden_dim, out_dim),
-        ])
-        # InstanceNorm to normalize each [N1×N2] similarity map
-        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-
-        # # ─── 2) AFA-U “unified” module to predict number of inliers K
-        # #  univ_size = maximum graph size, used to pad all embeddings to fixed length
-        # self.k_top_encoder = AFAUEncoder()
-
-        # # Two small MLPs to reduce pooled embedding → scalar in [0,1]
-        # self.final_row = nn.Sequential(
-        #     nn.Linear(out_dim, 8),
-        #     nn.ReLU(),
-        #     nn.Linear(8, 1),
-        #     nn.Sigmoid()
-        # )
-        # self.final_col = nn.Sequential(
-        #     nn.Linear(out_dim, 8),
-        #     nn.ReLU(),
-        #     nn.Linear(8, 1),
-        #     nn.Sigmoid()
-        # )
-
-        # Sinkhorn-TopK hyperparams
-        self.sinkhorn_max_iter = sinkhorn_max_iter
-        self.sinkhorn_tau      = sinkhorn_tau
-
-    def encode(self, x, edge_index):
-        """
-        Pass input features x through the two GATv2Conv layers.
-        Apply ReLU after the first, but not after the last.
-        """
-        for i, conv in enumerate(self.gnn):
-            x = conv(x, edge_index)
-            if i < len(self.gnn) - 1:
-                x = F.relu(x)
-        return x
-
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-        """
-        batch1, batch2: PyG Data objects for the two graphs in each pair.
-        batch_idx1, batch_idx2: optional precomputed batch assignments.
-        Returns a list of final hard match matrices (perm_pred_list) and
-        the raw embeddings for each graph pair (all_embeddings).
-        """
-        # device = next(self.parameters()).device
-
-        # ─── 1) Unpack node features & edge indices, move to GPU/CPU
-        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-
-        # ─── 2) Determine which node belongs to which graph in the batch
-        #    If not supplied, read from Data.batch
-        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
-        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-
-        # ─── 3) Encode both sets of nodes via the GNN
-        h1 = self.encode(x1, edge1)  # [total_nodes1, out_dim]
-        h2 = self.encode(x2, edge2)  # [total_nodes2, out_dim]
-
-        # How many graph pairs in this minibatch?
-        B = batch_idx1.max().item() + 1
-
-        perm_pred_list = []
-        all_embeddings = []
-
-        for b in range(B):
-            # Isolate embeddings for the b-th graph pair
-            h1_i = h1[batch_idx1 == b]  # shape [N1, d]
-            h2_i = h2[batch_idx2 == b]  # shape [N2, d]
-            N1, N2 = h1_i.size(0), h2_i.size(0)
-
-            # ─── 4) Compute raw similarity: dot product between all node pairs
-            sim = torch.matmul(h1_i, h2_i.T)    # [N1, N2]
-            # Normalize per-instance so Sinkhorn is stable
-            sim_b = sim.unsqueeze(0).unsqueeze(1)   # [1,1,N1,N2]
-            sim_n = self.inst_norm(sim_b).squeeze(1)  # [1,N1,N2]
-
-            # Prepare row/col sizes for pygmtools
-            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
-            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
-
-            # Soft Sinkhorn → soft_match [N1,N2]
-            # soft_S = pygmtools.sinkhorn(sim_n, n1=n1_t, n2=n2_t, dummy_row=False)[0]
-
-            # # ─── 5) AFA-U predicts inlier count K from soft matching
-            # #   a) Expand dims to batch form
-            # row_emb = h1_i.unsqueeze(0)      # [1, N1, d]
-            # col_emb = h2_i.unsqueeze(0)      # [1, N2, d]
-            # cost_mat = sim_n                 # [1, N1, N2]
-
-            # #   b) Run the bipartite-attention encoder
-            # out_r, out_c = self.k_top_encoder(row_emb, col_emb, cost_mat) # [1, N1, d], [1, N2, d]
-            
-            # #   c) Dynamic max over nodes
-            # g_r = out_r.max(dim=1).values     # [1, d]
-            # g_c = out_c.max(dim=1).values     # [1, d]
-
-            # #   d) Small MLPs → fraction in [0,1]
-            # k_r = self.final_row(g_r).squeeze(-1)  # [1]
-            # k_c = self.final_col(g_c).squeeze(-1)  # [1]
-            # ks  = (k_r + k_c) / 2                  # [1] average of row/col predictions
-
-            # ─── 6) Top-K matching
-
-            # use ground-truth K
-            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
-            hard_S, soft_S = soft_topk(
-                sim_n, ks_gt,
-                max_iter=self.sinkhorn_max_iter,
-                tau=self.sinkhorn_tau,
-                nrows=n1_t, ncols=n2_t,
-                return_prob=True
-            )
-
-            if self.training:
-                perm_pred_list.append(soft_S[0])
-            else:
-            #     ks_eff = (ks * N2).long()
-            #     hard_S = soft_topk(
-            #         sim_n, ks_eff,
-            #         max_iter=self.sinkhorn_max_iter,
-            #         tau=self.sinkhorn_tau,
-            #         nrows=n1_t, ncols=n2_t,
-            #         return_prob=False
-            #     )
-                perm_pred_list.append(hard_S[0])
-
-
-            # ─── 7) Collect outputs for this pair
-            all_embeddings.append((h1_i, h2_i))   # store embeddings for any downstream use
-
-        return perm_pred_list, all_embeddings
-
-# %%
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
@@ -3371,8 +3140,9 @@ in_dim = 7
 hidden_dim = 64
 out_dim = 32
 num_epochs = 100
-learning_rate = 0.001
-batch_size = 3
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -3386,8 +3156,9 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
@@ -3498,160 +3269,6 @@ val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
 # %%
-# AFA-U inlier predictor and Top-K matching from AFAT
-from k_pred_net import Encoder as AFAUEncoder
-from sinkhorn_topk import soft_topk
-
-class MatchingModel_GATv2SinkhornTopK(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-        sinkhorn_max_iter: int = 10,
-        sinkhorn_tau: float = 1.0,
-    ):
-        super().__init__()
-        # ─── 1) GNN backbone: two-layer GATv2
-        # First GATv2Conv projects in_dim → hidden_dim, apply ReLU
-        # Second GATv2Conv projects hidden_dim → out_dim, no activation afterwards
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim),
-            GATv2Conv(hidden_dim, out_dim),
-        ])
-        # InstanceNorm to normalize each [N1×N2] similarity map
-        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-
-        # # ─── 2) AFA-U “unified” module to predict number of inliers K
-        # #  univ_size = maximum graph size, used to pad all embeddings to fixed length
-        # self.k_top_encoder = AFAUEncoder()
-
-        # # Two small MLPs to reduce pooled embedding → scalar in [0,1]
-        # self.final_row = nn.Sequential(
-        #     nn.Linear(out_dim, 8),
-        #     nn.ReLU(),
-        #     nn.Linear(8, 1),
-        #     nn.Sigmoid()
-        # )
-        # self.final_col = nn.Sequential(
-        #     nn.Linear(out_dim, 8),
-        #     nn.ReLU(),
-        #     nn.Linear(8, 1),
-        #     nn.Sigmoid()
-        # )
-
-        # Sinkhorn-TopK hyperparams
-        self.sinkhorn_max_iter = sinkhorn_max_iter
-        self.sinkhorn_tau      = sinkhorn_tau
-
-    def encode(self, x, edge_index):
-        """
-        Pass input features x through the two GATv2Conv layers.
-        Apply ReLU after the first, but not after the last.
-        """
-        for i, conv in enumerate(self.gnn):
-            x = conv(x, edge_index)
-            if i < len(self.gnn) - 1:
-                x = F.relu(x)
-        return x
-
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-        """
-        batch1, batch2: PyG Data objects for the two graphs in each pair.
-        batch_idx1, batch_idx2: optional precomputed batch assignments.
-        Returns a list of final hard match matrices (perm_pred_list) and
-        the raw embeddings for each graph pair (all_embeddings).
-        """
-        # device = next(self.parameters()).device
-
-        # ─── 1) Unpack node features & edge indices, move to GPU/CPU
-        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-
-        # ─── 2) Determine which node belongs to which graph in the batch
-        #    If not supplied, read from Data.batch
-        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
-        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-
-        # ─── 3) Encode both sets of nodes via the GNN
-        h1 = self.encode(x1, edge1)  # [total_nodes1, out_dim]
-        h2 = self.encode(x2, edge2)  # [total_nodes2, out_dim]
-
-        # How many graph pairs in this minibatch?
-        B = batch_idx1.max().item() + 1
-
-        perm_pred_list = []
-        all_embeddings = []
-
-        for b in range(B):
-            # Isolate embeddings for the b-th graph pair
-            h1_i = h1[batch_idx1 == b]  # shape [N1, d]
-            h2_i = h2[batch_idx2 == b]  # shape [N2, d]
-            N1, N2 = h1_i.size(0), h2_i.size(0)
-
-            # ─── 4) Compute raw similarity: dot product between all node pairs
-            sim = torch.matmul(h1_i, h2_i.T)    # [N1, N2]
-            # Normalize per-instance so Sinkhorn is stable
-            sim_b = sim.unsqueeze(0).unsqueeze(1)   # [1,1,N1,N2]
-            sim_n = self.inst_norm(sim_b).squeeze(1)  # [1,N1,N2]
-
-            # Prepare row/col sizes for pygmtools
-            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
-            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
-
-            # Soft Sinkhorn → soft_match [N1,N2]
-            # soft_S = pygmtools.sinkhorn(sim_n, n1=n1_t, n2=n2_t, dummy_row=False)[0]
-
-            # # ─── 5) AFA-U predicts inlier count K from soft matching
-            # #   a) Expand dims to batch form
-            # row_emb = h1_i.unsqueeze(0)      # [1, N1, d]
-            # col_emb = h2_i.unsqueeze(0)      # [1, N2, d]
-            # cost_mat = sim_n                 # [1, N1, N2]
-
-            # #   b) Run the bipartite-attention encoder
-            # out_r, out_c = self.k_top_encoder(row_emb, col_emb, cost_mat) # [1, N1, d], [1, N2, d]
-            
-            # #   c) Dynamic max over nodes
-            # g_r = out_r.max(dim=1).values     # [1, d]
-            # g_c = out_c.max(dim=1).values     # [1, d]
-
-            # #   d) Small MLPs → fraction in [0,1]
-            # k_r = self.final_row(g_r).squeeze(-1)  # [1]
-            # k_c = self.final_col(g_c).squeeze(-1)  # [1]
-            # ks  = (k_r + k_c) / 2                  # [1] average of row/col predictions
-
-            # ─── 6) Top-K matching
-
-            # use ground-truth K
-            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
-            hard_S, soft_S = soft_topk(
-                sim_n, ks_gt,
-                max_iter=self.sinkhorn_max_iter,
-                tau=self.sinkhorn_tau,
-                nrows=n1_t, ncols=n2_t,
-                return_prob=True
-            )
-
-            if self.training:
-                perm_pred_list.append(soft_S[0])
-            else:
-            #     ks_eff = (ks * N2).long()
-            #     hard_S = soft_topk(
-            #         sim_n, ks_eff,
-            #         max_iter=self.sinkhorn_max_iter,
-            #         tau=self.sinkhorn_tau,
-            #         nrows=n1_t, ncols=n2_t,
-            #         return_prob=False
-            #     )
-                perm_pred_list.append(hard_S[0])
-
-
-            # ─── 7) Collect outputs for this pair
-            all_embeddings.append((h1_i, h2_i))   # store embeddings for any downstream use
-
-        return perm_pred_list, all_embeddings
-
-# %%
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
@@ -3661,8 +3278,9 @@ in_dim = 7
 hidden_dim = 64
 out_dim = 32
 num_epochs = 100
-learning_rate = 0.001
-batch_size = 3
+learning_rate = 1e-3
+batch_size = 16
+weight_decay = 1e-4
 
 # Early stopping
 best_val_loss = float('inf')
@@ -3676,8 +3294,9 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
