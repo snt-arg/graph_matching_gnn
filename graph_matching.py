@@ -53,6 +53,7 @@ from typing import List, Tuple
 import matplotlib.pyplot as plt
 import networkx as nx
 import numpy as np
+import pandas as pd
 import seaborn as sns
 from shapely.affinity import translate
 from shapely.geometry import Polygon
@@ -394,7 +395,8 @@ def split_graphs_stratified(
     val_frac: float   = 0.15,
     test_frac: float  = 0.15,
     n_bins: int       = 5,
-    seed: int         = seed
+    seed: int         = seed,
+    stratify_on: str  = "g2"     # "g1" oppure "g2"
 ) -> Tuple[
     List[Tuple[Data,Data,torch.Tensor]],
     List[Tuple[Data,Data,torch.Tensor]],
@@ -402,55 +404,52 @@ def split_graphs_stratified(
 ]:
     """
     Stratified split of graph-matching pairs into train/val/test.
-    Puoi specificare le frazioni (devono sommarsi a 1.0).
-    Stratifica sulla dimensione di g2 (num_nodes).
-
-    Args:
-        pairs: lista di tuple (g1, g2, P)
-        train_frac, val_frac, test_frac: frazioni per i tre set (somma = 1.0)
-        n_bins: numero di fasce per la stratificazione
-        seed: random seed
-
-    Returns:
-        train, val, test  —  tre liste di coppie
+    Puoi stratificare sulla dimensione di g1 o di g2.
     """
-    # verifica che le frazioni sommino a 1
+    assert stratify_on in ("g1","g2"), "stratify_on must be 'g1' or 'g2'"
     total = train_frac + val_frac + test_frac
-    assert abs(total - 1.0) < 1e-6, "train_frac+val_frac+test_frac must sum to 1.0"
+    assert abs(total - 1.0) < 1e-6, "train+val+test fractions must sum to 1.0"
 
-    # 1) calcola size per ciascuna coppia (numero nodi in g2)
-    sizes = np.array([g2.num_nodes for g1, g2, P in pairs])
+    # scegli la dimensione su cui stratificare
+    if stratify_on == "g1":
+        sizes = np.array([g1.num_nodes for g1, g2, P in pairs])
+    else:
+        sizes = np.array([g2.num_nodes for g1, g2, P in pairs])
 
-    # 2) crea bin di equal‑width su [min, max]
-    bins = np.linspace(sizes.min(), sizes.max()+1, n_bins+1)
-    size_bins = np.digitize(sizes, bins) - 1  # etichette 0…n_bins-1
+    # quantile‑binning per equal‑frequency
+    while n_bins > 1:
+        try:
+            size_bins = pd.qcut(sizes, q=n_bins, labels=False, duplicates="drop")
+        except ValueError:
+            n_bins -= 1
+            continue
+        counts = np.bincount(size_bins, minlength=n_bins)
+        if np.all(counts >= 2):
+            break
+        n_bins -= 1
 
-    # 3) primo split: train vs temp
-    train_idx, temp_idx = train_test_split(
-        np.arange(len(pairs)),
-        test_size=(1.0 - train_frac),
-        random_state=seed,
-        stratify=size_bins
-    )
+    idx = np.arange(len(pairs))
+    if n_bins <= 1:
+        # fallback random split
+        train_idx, temp_idx = train_test_split(idx, test_size=1-train_frac, random_state=seed)
+        rel_val = val_frac/(val_frac+test_frac)
+        val_idx, test_idx = train_test_split(temp_idx, test_size=1-rel_val, random_state=seed)
+    else:
+        train_idx, temp_idx = train_test_split(
+            idx, test_size=(1.0-train_frac),
+            random_state=seed, stratify=size_bins
+        )
+        rel_val = val_frac/(val_frac+test_frac)
+        temp_bins = size_bins[temp_idx]
+        val_idx, test_idx = train_test_split(
+            temp_idx, test_size=(1.0-rel_val),
+            random_state=seed, stratify=temp_bins
+        )
 
-    # 4) split del residuo temp in val/test
-    #    la frazione di temp da destinare a val è val_frac/(val_frac+test_frac)
-    rel_val_frac = val_frac / (val_frac + test_frac)
-    temp_bins = size_bins[temp_idx]
-    val_idx, test_idx = train_test_split(
-        temp_idx,
-        test_size=(1.0 - rel_val_frac),
-        random_state=seed,
-        stratify=temp_bins
-    )
-
-    # 5) costruisci le liste effettive
     train = [pairs[i] for i in train_idx]
     val   = [pairs[i] for i in val_idx]
     test  = [pairs[i] for i in test_idx]
-
     return train, val, test
-
 
 # Controllo rapido delle distribuzioni
 def describe(split, name):
