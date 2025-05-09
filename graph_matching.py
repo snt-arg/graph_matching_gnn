@@ -50,7 +50,6 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any
 from datetime import datetime
 
-
 # ─── Third-party libraries ─────────────────────────────────────────────────────
 import matplotlib.pyplot as plt
 import networkx as nx
@@ -75,7 +74,9 @@ from torch_geometric.nn import GATv2Conv, GCNConv
 
 from moviepy.editor import ImageSequenceClip
 import optuna
+import json
 
+# ─── Local application/library imports ────────────────────────────────────────
 import pygmtools
 pygmtools.BACKEND = 'pytorch'
 
@@ -827,12 +828,17 @@ def collate_pyg_matching(batch):
     
     return batch1, batch2, perm_list
 
-### OLD FUNCTION WITH BCE AND PLAIN ACCURACY
-# def train_epoch_sinkhorn(model, loader, optimizer):
+### FUNCTION WITH BCE
+# def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1e-9):
+#     """
+#     Trains one epoch of a Sinkhorn-based graph matching model using Binary Cross Entropy (BCE) loss.
+#     Returns:
+#         avg_loss (float): average BCE loss per batch.
+#         all_embeddings (list): collected embeddings from the model.
+#     """
 #     model.train()
-#     total_loss = 0
+#     total_loss = 0.0
 #     all_embeddings = []
-
 #     device = next(model.parameters()).device
 
 #     for batch1, batch2, perm_list in loader:
@@ -843,31 +849,43 @@ def collate_pyg_matching(batch):
 #         optimizer.zero_grad()
 #         batch_idx1 = batch1.batch
 #         batch_idx2 = batch2.batch
-
 #         pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
 
-#         loss = sum(F.binary_cross_entropy(pred, target) for pred, target in zip(pred_perm_list, perm_list))
-#         loss /= len(perm_list)
+#         # BCE loss over doubly-stochastic matrix from Sinkhorn
+#         batch_loss = 0.0
+#         for P, P_gt in zip(pred_perm_list, perm_list):
+#             # Binary Cross Entropy element-wise
+#             loss = - (P_gt * torch.log(P + eps) + (1 - P_gt) * torch.log(1 - P + eps))
+#             batch_loss += loss.mean()
+#         batch_loss = batch_loss / len(pred_perm_list)
 
-#         loss.backward()
+#         batch_loss.backward()
+#         log_gradients(writer, model, epoch)
 #         optimizer.step()
 
-#         total_loss += loss.item()
+#         total_loss += batch_loss.item()
 #         all_embeddings.extend(batch_embeddings)
 
 #     avg_loss = total_loss / len(loader)
 #     return avg_loss, all_embeddings
 
-
-# def evaluate_sinkhorn(model, loader):
+# def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
+#     """
+#     Evaluates a Sinkhorn-based graph matching model using Binary Cross Entropy
+#     and permutation accuracy.
+#     Returns:
+#         avg_acc (float): permutation accuracy over all columns.
+#         avg_loss (float): average BCE loss per example.
+#         all_embeddings (list): collected embeddings from the model.
+#     """
 #     model.eval()
 #     correct = 0
-#     total = 0
-#     total_loss = 0
+#     total_cols = 0
+#     total_loss = 0.0
+#     num_graphs = 0
 #     all_embeddings = []
 
 #     device = next(model.parameters()).device
-
 #     with torch.no_grad():
 #         for batch1, batch2, perm_list in loader:
 #             batch1 = batch1.to(device)
@@ -876,49 +894,124 @@ def collate_pyg_matching(batch):
 
 #             batch_idx1 = batch1.batch
 #             batch_idx2 = batch2.batch
-
 #             pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
 
-#             for pred, target in zip(pred_perm_list, perm_list):
-#                 pred_indices = pred.argmax(dim=1)
-#                 target_indices = target.argmax(dim=1)
+#             for P, P_gt in zip(pred_perm_list, perm_list):
+#                 # permutation accuracy: column-wise argmax compare
+#                 pred_idx = P.argmax(dim=0)
+#                 target_idx = P_gt.argmax(dim=0)
+#                 correct += (pred_idx == target_idx).sum().item()
+#                 total_cols += P.shape[1]
 
-#                 correct += (pred_indices == target_indices).sum().item()
-#                 total += pred.size(0)
+#                 # Binary Cross Entropy element-wise
+#                 loss = - (P_gt * torch.log(P + eps) + (1 - P_gt) * torch.log(1 - P + eps))
+#                 total_loss += loss.mean().item()
+#                 num_graphs += 1
 
-#             loss = sum(F.binary_cross_entropy(pred, target) for pred, target in zip(pred_perm_list, perm_list))
-#             total_loss += loss.item()
 #             all_embeddings.extend(batch_embeddings)
 
-#     avg_acc = correct / total if total > 0 else 0.0
-#     avg_loss = total_loss / len(loader)
+#     avg_acc = correct / total_cols if total_cols > 0 else 0.0
+#     avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
 #     return avg_acc, avg_loss, all_embeddings
 
+### FUNCTIONS WITH COLUMN-WISE CE
+# def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1e-9):
+#     """
+#     Trains one epoch of a Sinkhorn-based graph matching model using column-wise cross-entropy loss.
+#     Returns:
+#         avg_loss (float): average column CE loss per batch.
+#         all_embeddings (list): collected embeddings from the model.
+#     """
+#     model.train()
+#     total_loss = 0.0
+#     all_embeddings = []
+#     device = next(model.parameters()).device
 
-# def predict_matching_matrix(model, data1, data2, use_hungarian=True):
+#     for batch1, batch2, perm_list in loader:
+#         batch1 = batch1.to(device)
+#         batch2 = batch2.to(device)
+#         perm_list = [p.to(device) for p in perm_list]
+
+#         optimizer.zero_grad()
+#         batch_idx1 = batch1.batch
+#         batch_idx2 = batch2.batch
+#         pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
+
+#         # column-wise cross-entropy
+#         batch_loss = 0.0
+#         for P, P_gt in zip(pred_perm_list, perm_list):
+#             # For each column j: -sum_i P_gt[i,j] * log(P[i,j])
+#             ce_per_col = -torch.sum(P_gt * torch.log(P + eps), dim=0)
+#             batch_loss += ce_per_col.mean()
+#         batch_loss = batch_loss / len(pred_perm_list)
+
+#         batch_loss.backward()
+#         # Log gradients
+#         log_gradients(writer, model, epoch)
+#         optimizer.step()
+
+#         total_loss += batch_loss.item()
+#         all_embeddings.extend(batch_embeddings)
+
+#     avg_loss = total_loss / len(loader)
+#     return avg_loss, all_embeddings
+
+
+# def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
+#     """
+#     Evaluates a Sinkhorn-based graph matching model using column-wise cross-entropy
+#     and permutation accuracy.
+#     Returns:
+#         avg_acc (float): permutation accuracy over all columns.
+#         avg_loss (float): average column CE loss per example.
+#         all_embeddings (list): collected embeddings from the model.
+#     """
 #     model.eval()
+#     correct = 0
+#     total_cols = 0
+#     total_loss = 0.0
+#     num_graphs = 0
+#     all_embeddings = []
+
+#     device = next(model.parameters()).device
 #     with torch.no_grad():
-#         data1 = data1.to(device)
-#         data2 = data2.to(device)
-#         batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
-#         batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
+#         for batch1, batch2, perm_list in loader:
+#             batch1 = batch1.to(device)
+#             batch2 = batch2.to(device)
+#             perm_list = [p.to(device) for p in perm_list]
 
-#         sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2)
-#         sim = sim_matrix_list[0].unsqueeze(0)  # [1, N1, N2]
+#             batch_idx1 = batch1.batch
+#             batch_idx2 = batch2.batch
+#             pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
 
-#         n1 = torch.tensor([sim.shape[1]], dtype=torch.int32)
-#         n2 = torch.tensor([sim.shape[2]], dtype=torch.int32)
+#             for P, P_gt in zip(pred_perm_list, perm_list):
+#                 # permutation accuracy: column-wise argmax compare
+#                 pred_idx = P.argmax(dim=0)
+#                 target_idx = P_gt.argmax(dim=0)
+#                 correct += (pred_idx == target_idx).sum().item()
+#                 total_cols += P.shape[1]
 
-#         if use_hungarian:
-#             return pygmtools.hungarian(sim, n1=n1, n2=n2).squeeze(0)
-#         else:
-#             return sim
+#                 # column-wise CE loss
+#                 ce_per_col = -torch.sum(P_gt * torch.log(P + eps), dim=0)
+#                 total_loss += ce_per_col.mean().item()
+#                 num_graphs += 1
+
+#             all_embeddings.extend(batch_embeddings)
+
+#     avg_acc = correct / total_cols if total_cols > 0 else 0.0
+#     avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
+#     return avg_acc, avg_loss, all_embeddings
+
+### FUNCTIONS WITH BCE
+def bce_permutation_loss(P, P_gt, eps: float = 1e-9):
+    """Element-wise Binary Cross Entropy loss between prediction and ground truth."""
+    return - (P_gt * torch.log(P + eps) + (1 - P_gt) * torch.log(1 - P + eps)).mean()
 
 def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1e-9):
     """
-    Trains one epoch of a Sinkhorn-based graph matching model using column-wise cross-entropy loss.
+    Trains one epoch of a Sinkhorn-based graph matching model using Binary Cross Entropy (BCE) loss.
     Returns:
-        avg_loss (float): average column CE loss per batch.
+        avg_loss (float): average BCE loss per batch.
         all_embeddings (list): collected embeddings from the model.
     """
     model.train()
@@ -936,16 +1029,14 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
         batch_idx2 = batch2.batch
         pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
 
-        # column-wise cross-entropy
+        # BCE loss over doubly-stochastic matrix from Sinkhorn
         batch_loss = 0.0
         for P, P_gt in zip(pred_perm_list, perm_list):
-            # For each column j: -sum_i P_gt[i,j] * log(P[i,j])
-            ce_per_col = -torch.sum(P_gt * torch.log(P + eps), dim=0)
-            batch_loss += ce_per_col.mean()
+            loss = bce_permutation_loss(P, P_gt, eps)
+            batch_loss += loss
         batch_loss = batch_loss / len(pred_perm_list)
 
         batch_loss.backward()
-        # Log gradients
         log_gradients(writer, model, epoch)
         optimizer.step()
 
@@ -955,14 +1046,13 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
     avg_loss = total_loss / len(loader)
     return avg_loss, all_embeddings
 
-
 def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
     """
-    Evaluates a Sinkhorn-based graph matching model using column-wise cross-entropy
+    Evaluates a Sinkhorn-based graph matching model using Binary Cross Entropy
     and permutation accuracy.
     Returns:
         avg_acc (float): permutation accuracy over all columns.
-        avg_loss (float): average column CE loss per example.
+        avg_loss (float): average BCE loss per example.
         all_embeddings (list): collected embeddings from the model.
     """
     model.eval()
@@ -984,15 +1074,13 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
             pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
 
             for P, P_gt in zip(pred_perm_list, perm_list):
-                # permutation accuracy: column-wise argmax compare
                 pred_idx = P.argmax(dim=0)
                 target_idx = P_gt.argmax(dim=0)
                 correct += (pred_idx == target_idx).sum().item()
                 total_cols += P.shape[1]
 
-                # column-wise CE loss
-                ce_per_col = -torch.sum(P_gt * torch.log(P + eps), dim=0)
-                total_loss += ce_per_col.mean().item()
+                loss = bce_permutation_loss(P, P_gt, eps)
+                total_loss += loss.item()
                 num_graphs += 1
 
             all_embeddings.extend(batch_embeddings)
@@ -1406,163 +1494,234 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 #            PARAMETERS OPTIMIZATION
 #----------------------------------------
 
-# ----------------------------------------
-# 1) Script di ottimizzazione con Optuna
-# ----------------------------------------
+def objective_gm(trial, train_dataset, val_dataset, path):
+    # iperparametri da esplorare
+    lr           = trial.suggest_loguniform("lr", 1e-4, 1e-2)
+    weight_decay = trial.suggest_loguniform("weight_decay", 1e-6, 1e-3)
+    dropout      = trial.suggest_uniform("dropout", 0.0, 0.6)
+    hidden_dim   = trial.suggest_categorical("hidden_dim", [32, 64, 128])
+    out_dim      = trial.suggest_categorical("out_dim",    [16, 32, 64])
+    batch_size   = trial.suggest_categorical("batch_size", [2, 4, 8])
+    heads        = trial.suggest_int("heads",           1,   4)
+    attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
+    num_layers   = trial.suggest_int("num_layers",       1,   3)
+    sinkhorn_tau = trial.suggest_loguniform("tau",      1e-3, 1e-1)
+    max_iter     = trial.suggest_int("max_iter",        10, 100)
 
-# def objective(trial):
-#     # iperparametri da esplorare
-#     lr           = trial.suggest_loguniform("lr", 1e-4, 1e-2)
-#     weight_decay = trial.suggest_loguniform("weight_decay", 1e-6, 1e-3)
-#     dropout      = trial.suggest_uniform("dropout", 0.0, 0.6)
-#     hidden_dim   = trial.suggest_categorical("hidden_dim", [32, 64, 128])
-#     out_dim      = trial.suggest_categorical("out_dim",    [16, 32, 64])
-#     batch_size   = trial.suggest_categorical("batch_size", [2, 4, 8])
-#     heads        = trial.suggest_int("heads",           1,   4)
-#     attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
-#     num_layers   = trial.suggest_int("num_layers",       1,   3)
-#     sinkhorn_tau = trial.suggest_loguniform("tau",      1e-3, 1e-1)
-#     max_iter     = trial.suggest_int("max_iter",        10, 100)
+    # dataloader
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
-#     # dataloader
-#     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching)
-#     val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+    # modello
+    class MatchingModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.gnn = nn.ModuleList()
+            dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
+            for i in range(num_layers):
+                out_channels = dims[i+1] // heads if i < num_layers - 1 else dims[i+1]
+                concat = i < num_layers - 1
+                self.gnn.append(GATv2Conv(dims[i], out_channels, heads=heads, concat=concat, dropout=attn_dropout))
+            self.dropout = dropout
+            self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+            self.tau = sinkhorn_tau
+            self.max_iter = max_iter
 
-#     # modello
-#     class MatchingModel(nn.Module):
-#         def __init__(self):
-#             super().__init__()
-#             layers = []
-#             dims = [train_dataset.num_node_features] + [hidden_dim] * (num_layers-1) + [out_dim]
-#             for i in range(num_layers):
-#                 layers.append(
-#                     GATv2Conv(dims[i], dims[i+1], heads=heads,
-#                               dropout=attn_dropout, negative_slope=0.2)
-#                 )
-#             self.gnn = nn.ModuleList(layers)
-#             self.dropout = dropout
-#             self.inst_norm = InstanceNorm2d(1, affine=True)
-#             self.tau = sinkhorn_tau
-#             self.max_iter = max_iter
+        def encode(self, x, edge_index):
+            for i, conv in enumerate(self.gnn):
+                x = conv(x, edge_index)
+                if i < len(self.gnn)-1:
+                    x = F.relu(x)
+                    x = F.dropout(x, p=self.dropout, training=self.training)
+            return x
 
-#         def encode(self, x, edge_index):
-#             for i, conv in enumerate(self.gnn):
-#                 x = conv(x, edge_index)
-#                 if i < len(self.gnn)-1:
-#                     x = F.relu(x)
-#                     x = F.dropout(x, p=self.dropout, training=self.training)
-#             return x
+        def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None):
+            device = next(self.parameters()).device
+            x1, e1 = batch1.x.to(device), batch1.edge_index.to(device)
+            x2, e2 = batch2.x.to(device), batch2.edge_index.to(device)
+            if batch_idx1 is None:
+                batch_idx1 = batch1.batch.to(device)
+                batch_idx2 = batch2.batch.to(device)
+            h1 = self.encode(x1, e1)
+            h2 = self.encode(x2, e2)
+            B = batch_idx1.max().item()+1
+            loss = 0
+            for b in range(B):
+                h1_b = h1[batch_idx1==b]
+                h2_b = h2[batch_idx2==b]
+                sim = torch.matmul(h1_b, h2_b.T).unsqueeze(0).unsqueeze(1)
+                sim_n = self.inst_norm(sim).squeeze(1)
+                n1 = torch.tensor([h1_b.size(0)], dtype=torch.int32, device=device)
+                n2 = torch.tensor([h2_b.size(0)], dtype=torch.int32, device=device)
+                S = pygmtools.sinkhorn(sim_n, n1=n1, n2=n2, dummy_row=False,
+                                       tau=self.tau, max_iter=self.max_iter)[0]
+                loss = loss + bce_permutation_loss(S, perm_list[b])
+            return loss / B
 
-#         def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
-#             device = next(self.parameters()).device
-#             x1, e1 = batch1.x.to(device), batch1.edge_index.to(device)
-#             x2, e2 = batch2.x.to(device), batch2.edge_index.to(device)
-#             if batch_idx1 is None:
-#                 batch_idx1 = batch1.batch.to(device)
-#                 batch_idx2 = batch2.batch.to(device)
-#             h1 = self.encode(x1, e1)
-#             h2 = self.encode(x2, e2)
-#             B = batch_idx1.max().item()+1
-#             loss = 0
-#             for b in range(B):
-#                 h1_b = h1[batch_idx1==b]
-#                 h2_b = h2[batch_idx2==b]
-#                 sim = torch.matmul(h1_b, h2_b.T).unsqueeze(0).unsqueeze(1)
-#                 sim_n = self.inst_norm(sim).squeeze(1)
-#                 n1 = torch.tensor([h1_b.size(0)], dtype=torch.int32, device=device)
-#                 n2 = torch.tensor([h2_b.size(0)], dtype=torch.int32, device=device)
-#                 S = pygmtools.sinkhorn(sim_n, n1=n1, n2=n2, dummy_row=False,
-#                                        tau=self.tau, max_iter=self.max_iter)[0]
-#                 loss = loss + loss_fn(S, batch2.perm_gt_list[b])
-#             return loss / B
+    model = MatchingModel().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-#     model = MatchingModel().to(device)
-#     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+    # training rapido con early stopping
+    best_val = float('inf')
+    counter = 0
+    for epoch in range(30):
+        # train
+        model.train()
+        for b1, b2, perm in train_loader:
+            optimizer.zero_grad()
+            loss = model(b1, b2, perm)
+            loss.backward()
+            optimizer.step()
+        # validate
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for b1, b2, perm in val_loader:
+                val_loss += model(b1, b2, perm).item()
+        val_loss /= len(val_loader)
+        trial.report(val_loss, epoch)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+        if val_loss < best_val:
+            best_val = val_loss
+            counter = 0
+        else:
+            counter += 1
+            if counter >= 5:
+                break
+    
+    # save best trial info
+    if trial.number == 0 or best_val <= trial.study.best_value:
+        result = {
+            "val_loss": best_val,
+            "params": trial.params
+        }
+        if not os.path.exists(path):
+            os.makedirs(path)
+        with open(os.join(path, "best_trial_results.json"), "w") as f:
+            json.dump(result, f, indent=2)
 
-#     # training rapido con early stopping
-#     best_val = float('inf')
-#     counter = 0
-#     for epoch in range(30):
-#         # train
-#         model.train()
-#         for b1, b2, _ in train_loader:
-#             optimizer.zero_grad()
-#             loss = model(b1, b2)
-#             loss.backward()
-#             optimizer.step()
-#         # validate
-#         model.eval()
-#         val_loss = 0
-#         with torch.no_grad():
-#             for b1, b2, _ in val_loader:
-#                 val_loss += model(b1, b2).item()
-#         val_loss /= len(val_loader)
-#         trial.report(val_loss, epoch)
-#         if trial.should_prune():
-#             raise optuna.TrialPruned()
-#         if val_loss < best_val:
-#             best_val = val_loss
-#             counter = 0
-#         else:
-#             counter += 1
-#             if counter >= 5:
-#                 break
+    return best_val
 
-#     return best_val
+def objective_pgm(trial, train_dataset, val_dataset, path):
+    lr           = trial.suggest_loguniform("lr", 1e-4, 1e-2)
+    weight_decay = trial.suggest_loguniform("weight_decay", 1e-6, 1e-3)
+    dropout_emb  = trial.suggest_uniform("dropout", 0.0, 0.6)
+    hidden_dim   = trial.suggest_categorical("hidden_dim", [32, 64, 128])
+    out_dim      = trial.suggest_categorical("out_dim",    [16, 32, 64])
+    batch_size   = trial.suggest_categorical("batch_size", [2, 4, 8])
+    attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
+    max_iter     = trial.suggest_int("max_iter",        10, 100)
+    tau          = trial.suggest_loguniform("tau",      1e-3, 1e-1)
+    num_layers   = trial.suggest_int("num_layers",       1, 3)
 
-# if __name__ == "__main__":
-#     study = optuna.create_study(direction="minimize")
-#     study.optimize(objective, n_trials=30)
-#     best = study.best_trial
-#     print("Best trial:", best.value)
-#     print(best.params)
-#     with open("best_hparams.json", "w") as f:
-#         json.dump(best.params, f, indent=2)
-#     print("Saved best_hparams.json")
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching)
+    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
+    # Flexible model for partial matching
+    class MatchingModel_GATv2SinkhornTopK_OPT(nn.Module):
+        def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter, sinkhorn_tau,
+                    attention_dropout, dropout_emb, num_layers):
+            super().__init__()
+            self.gnn = nn.ModuleList()
+            dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
+            for i in range(num_layers):
+                self.gnn.append(GATv2Conv(dims[i], dims[i+1], dropout=attention_dropout))
+            self.dropout = nn.Dropout(p=dropout_emb)
+            self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+            self.sinkhorn_max_iter = sinkhorn_max_iter
+            self.sinkhorn_tau = sinkhorn_tau
 
-# ----------------------------------------
-# 2) Script di training finale
-# ----------------------------------------
+        def encode(self, x, edge_index):
+            for i, conv in enumerate(self.gnn):
+                x = conv(x, edge_index)
+                if i < len(self.gnn) - 1:
+                    x = F.relu(x)
+                    x = self.dropout(x)
+            return x
 
-# # Carica i migliori iperparametri
-# with open("best_hparams.json") as f:
-#     params = json.load(f)
+        def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None):
+            device = next(self.parameters()).device
+            x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+            x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
 
-# # Dataloader
-# train_loader = DataLoader(train_dataset, batch_size=params["batch_size"], shuffle=True, collate_fn=collate_pyg_matching)
-# val_loader   = DataLoader(val_dataset,   batch_size=params["batch_size"], shuffle=False, collate_fn=collate_pyg_matching)
-# test_loader  = DataLoader(test_dataset,  batch_size=params["batch_size"], shuffle=False, collate_fn=collate_pyg_matching)
+            batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+            batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
 
-# # Modello come sopra
-# model = MatchingModel(
-#     in_dim=train_dataset.num_node_features,
-#     hidden_dim=params["hidden_dim"],
-#     out_dim=params["out_dim"],
-#     dropout=params["dropout"],
-#     heads=params["heads"],
-#     attn_dropout=params["attn_dropout"],
-#     neg_slope=0.2,
-#     num_layers=params["num_layers"],
-#     sinkhorn_tau=params["tau"],
-#     sinkhorn_max_iter=params["max_iter"]
-# ).to(device)
+            h1 = self.encode(x1, edge1)
+            h2 = self.encode(x2, edge2)
 
-# optimizer = torch.optim.AdamW(
-#     model.parameters(),
-#     lr=params["lr"],
-#     weight_decay=params["weight_decay"]
-# )
+            B = batch_idx1.max().item() + 1
+            loss = 0.0
+            for b in range(B):
+                h1_b = h1[batch_idx1 == b]
+                h2_b = h2[batch_idx2 == b]
+                sim = torch.matmul(h1_b, h2_b.T).unsqueeze(0).unsqueeze(1)
+                sim_n = self.inst_norm(sim).squeeze(1)
 
-# # Training completo
-# train_losses, val_losses, _ = train_loop(
-#     model, optimizer,
-#     train_loader, val_loader,
-#     num_epochs=100,
-#     patience=10
-# )
+                n1 = torch.tensor([h1_b.size(0)], dtype=torch.int32, device=device)
+                n2 = torch.tensor([h2_b.size(0)], dtype=torch.int32, device=device)
+                ks_gt = torch.tensor([h2_b.size(0)], dtype=torch.long, device=device)
 
-# Plot delle loss\ nplot_losses(train_losses, val_losses, output_path="losses.png")
+                _, soft_S = soft_topk(sim_n, ks_gt, max_iter=self.sinkhorn_max_iter,
+                                    tau=self.sinkhorn_tau, nrows=n1, ncols=n2,
+                                    return_prob=True)
+
+                loss += bce_permutation_loss(soft_S[0], perm_list[b])
+            return loss / B
+
+    model = MatchingModel_GATv2SinkhornTopK_OPT(
+        in_dim=train_dataset[0][0].x.size(1),
+        hidden_dim=hidden_dim,
+        out_dim=out_dim,
+        sinkhorn_max_iter=max_iter,
+        sinkhorn_tau=tau,
+        attention_dropout=attn_dropout,
+        dropout_emb=dropout_emb,
+        num_layers=num_layers
+    ).to(device)
+
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+
+    best_val = float('inf')
+    counter = 0
+    for epoch in range(30):
+        model.train()
+        for b1, b2, perm in train_loader:
+            optimizer.zero_grad()
+            loss = model(b1, b2, perm)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for b1, b2, perm in val_loader:
+                val_loss += model(b1, b2, perm).item()
+        val_loss /= len(val_loader)
+        trial.report(val_loss, epoch)
+        if trial.should_prune():
+            raise optuna.TrialPruned()
+        if val_loss < best_val:
+            best_val = val_loss
+            counter = 0
+        else:
+            counter += 1
+            if counter >= 5:
+                break
+
+    # save best trial info
+    if trial.number == 0 or best_val <= trial.study.best_value:
+        result = {
+            "val_loss": best_val,
+            "params": trial.params
+        }
+        if not os.path.exists(path):
+            os.makedirs(path)
+        with open(os.join(path, "best_trial_results.json"), "w") as f:
+            json.dump(result, f, indent=2)
+
+    return best_val
 
 #----------------------------------------
 #            XAI UTILS
@@ -2972,6 +3131,22 @@ plot_two_graphs_with_matching(
     path=os.path.join(models_path, "test.png")
 )
 
+# %%
+#param opt 
+study = optuna.create_study(direction="minimize")
+study.optimize(lambda trial: objective_gm(trial, train_dataset, val_dataset,models_path), n_trials=30)
+print("Best hyperparameters: ", study.best_params)
+print("Best trial: ", study.best_trial)
+print("Best value: ", study.best_value)
+# Save the study
+with open(os.path.join(models_path, "study.pkl"), "wb") as f:
+    pickle.dump(study, f)
+# # Load the study
+# with open(os.path.join(models_path, "study.pkl"), "rb") as f:
+#     study = pickle.load(f)
+# Plot the study
+# optuna.visualization.plot_optimization_history(study).show()
+
 # %% [markdown]
 # # Partial graph matching
 
@@ -3239,6 +3414,22 @@ plot_two_graphs_with_matching(
     path=os.path.join(models_path, "test.png")
 )
 
+# %%
+#param opt 
+study = optuna.create_study(direction="minimize")
+study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset,models_path), n_trials=30)
+print("Best hyperparameters: ", study.best_params)
+print("Best trial: ", study.best_trial)
+print("Best value: ", study.best_value)
+# Save the study
+with open(os.path.join(models_path, "study.pkl"), "wb") as f:
+    pickle.dump(study, f)
+# # Load the study
+# with open(os.path.join(models_path, "study.pkl"), "rb") as f:
+#     study = pickle.load(f)
+# Plot the study
+# optuna.visualization.plot_optimization_history(study).show()
+
 # %% [markdown]
 # ## Room dropout equal
 
@@ -3502,5 +3693,21 @@ plot_two_graphs_with_matching(
     match_display="wrong",
     path=os.path.join(models_path, "test.png")
 )
+
+# %%
+#param opt 
+study = optuna.create_study(direction="minimize")
+study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset,models_path), n_trials=30)
+print("Best hyperparameters: ", study.best_params)
+print("Best trial: ", study.best_trial)
+print("Best value: ", study.best_value)
+# Save the study
+with open(os.path.join(models_path, "study.pkl"), "wb") as f:
+    pickle.dump(study, f)
+# # Load the study
+# with open(os.path.join(models_path, "study.pkl"), "rb") as f:
+#     study = pickle.load(f)
+# Plot the study
+# optuna.visualization.plot_optimization_history(study).show()
 
 
