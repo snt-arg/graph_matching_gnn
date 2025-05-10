@@ -1539,6 +1539,8 @@ def objective_gm(trial, train_dataset, val_dataset, path):
             device = next(self.parameters()).device
             x1, e1 = batch1.x.to(device), batch1.edge_index.to(device)
             x2, e2 = batch2.x.to(device), batch2.edge_index.to(device)
+            perm_list = [p.to(device) for p in perm_list]
+            
             if batch_idx1 is None:
                 batch_idx1 = batch1.batch.to(device)
                 batch_idx2 = batch2.batch.to(device)
@@ -1644,6 +1646,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
             device = next(self.parameters()).device
             x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
             x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+            perm_list = [p.to(device) for p in perm_list]
 
             batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
             batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
