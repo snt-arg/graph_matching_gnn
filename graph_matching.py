@@ -1429,7 +1429,7 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 
             n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
             n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
-            S = pygmtools.sinkhorn(M_normed, n1=n1_t, n2=n2_t, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)[0]
+            S = pygmtools.sinkhorn(M_normed, n1=n1_t, n2=n2_t, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
             
             ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
             
@@ -1480,9 +1480,11 @@ def objective_gm(trial, train_dataset, val_dataset, path):
             self.gnn = nn.ModuleList()
             dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
             for i in range(num_layers):
-                out_channels = dims[i+1] // heads if i < num_layers - 1 else dims[i+1]
-                concat = i < num_layers - 1
-                self.gnn.append(GATv2Conv(dims[i], out_channels, heads=heads, concat=concat, dropout=attn_dropout))
+                # new: always average the heads so the feature‐dim stays dims[i+1]
+                self.gnn.append(
+                GATv2Conv(dims[i], dims[i+1],
+                            heads=heads, concat=False,
+                            dropout=attn_dropout))
             self.dropout = dropout
             # bilinear weight matrix A per affinity
             std = 1.0 / math.sqrt(out_dim)
@@ -1597,6 +1599,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
     tau          = trial.suggest_loguniform("tau",      1e-3, 1e-1)
     num_layers   = trial.suggest_int("num_layers",       1, 3)
     temperature  = trial.suggest_loguniform("temperature", 1e-2, 1e1)
+    heads        = trial.suggest_int("heads",           1,   4)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching)
     val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
@@ -1604,12 +1607,16 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
     # Flexible model for partial matching
     class MatchingModel_GATv2SinkhornTopK_OPT(nn.Module):
         def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter, sinkhorn_tau,
-                    attention_dropout, dropout_emb, num_layers, temperature):
+                    attention_dropout, dropout_emb, num_layers, temperature, heads):
             super().__init__()
             self.gnn = nn.ModuleList()
             dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
             for i in range(num_layers):
-                self.gnn.append(GATv2Conv(dims[i], dims[i+1], dropout=attention_dropout))
+                # new: always average the heads so the feature‐dim stays dims[i+1]
+                self.gnn.append(
+                GATv2Conv(dims[i], dims[i+1],
+                            heads=heads, concat=False,
+                            dropout=attention_dropout))
             self.dropout = nn.Dropout(p=dropout_emb)
             # bilinear weight matrix A per affinity
             std = 1.0 / math.sqrt(out_dim)
@@ -1657,7 +1664,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
 
                 n1 = torch.tensor([h1_b.size(0)], dtype=torch.int32, device=device)
                 n2 = torch.tensor([h2_b.size(0)], dtype=torch.int32, device=device)
-                S = pygmtools.sinkhorn(M_normed, n1=n1, n2=n2, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)[0]
+                S = pygmtools.sinkhorn(M_normed, n1=n1, n2=n2, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
 
                 ks_gt = torch.tensor([h2_b.size(0)], dtype=torch.long, device=device)
 
@@ -1677,7 +1684,8 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
         attention_dropout=attn_dropout,
         dropout_emb=dropout_emb,
         num_layers=num_layers,
-        temperature=temperature
+        temperature=temperature,
+        heads=heads
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -3137,7 +3145,7 @@ plot_two_graphs_with_matching(
 # %%
 #param opt 
 study = optuna.create_study(direction="minimize")
-study.optimize(lambda trial: objective_gm(trial, train_dataset, val_dataset,models_path), n_trials=30)
+study.optimize(lambda trial: objective_gm(trial, train_dataset, val_dataset, models_path), n_trials=30)
 print("Best hyperparameters: ", study.best_params)
 print("Best trial: ", study.best_trial)
 print("Best value: ", study.best_value)
@@ -3208,7 +3216,7 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 # Logger TensorBoard
@@ -3340,7 +3348,7 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 # Logger TensorBoard
@@ -3488,7 +3496,7 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 # Logger TensorBoard
@@ -3620,7 +3628,7 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+model = MatchingModel_GATv2SinkhornTopK(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 # Logger TensorBoard
