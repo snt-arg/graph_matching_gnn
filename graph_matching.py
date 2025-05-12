@@ -1036,7 +1036,7 @@ def predict_matching_matrix(model, data1, data2, use_hungarian: bool = True):
         batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
         batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
 
-        sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2)
+        sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2, inference=True)
         sim = sim_matrix_list[0].unsqueeze(0)  # [1, N1, N2]
 
         n1 = torch.tensor([sim.shape[1]], dtype=torch.int32, device=device)
@@ -1306,10 +1306,10 @@ class MatchingModel_GATv2Sinkhorn(nn.Module):
             GATv2Conv(hidden_dim, out_dim, dropout=attention_dropout)
         ])
         self.dropout = nn.Dropout(p=dropout_emb)
-        # bilinear weight matrix A per affinity
-        std = 1.0 / math.sqrt(out_dim)
-        self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
-        self.temperature = temperature
+        # # bilinear weight matrix A per affinity
+        # std = 1.0 / math.sqrt(out_dim)
+        # self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
+        # self.temperature = temperature
         # InstanceNorm per-sample
         self.inst_norm = nn.InstanceNorm2d(1, affine=True)
         # Sinkhorn hyperparams
@@ -1324,7 +1324,7 @@ class MatchingModel_GATv2Sinkhorn(nn.Module):
                 x = self.dropout(x)
         return x
 
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
 
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
@@ -1344,16 +1344,20 @@ class MatchingModel_GATv2Sinkhorn(nn.Module):
             h1_b = h1[batch_idx1 == b]   # [n1, d]
             h2_b = h2[batch_idx2 == b]   # [n2, d]
 
-            # ---- bilinear affinity ----
-            # scores_{ij} = (h1_b @ A @ h2_b.T) / temperature
-            scores = (h1_b @ self.A) @ h2_b.T
-            M = torch.exp(scores / self.temperature)  # [n1, n2]
+            # # ---- bilinear affinity ----
+            # # scores_{ij} = (h1_b @ A @ h2_b.T) / temperature
+            # scores = (h1_b @ self.A) @ h2_b.T
+            # M = torch.exp(scores / self.temperature)  # [n1, n2]
+            # # normalize and sinkhorn
+            # M_batched = M.unsqueeze(0).unsqueeze(1)  # [1,1,n1,n2]
+            # M_normed = self.inst_norm(M_batched).squeeze(1)  # [1,n1,n2] -> [n1,n2]
 
-            # normalize and sinkhorn
-            M_batched = M.unsqueeze(0).unsqueeze(1)  # [1,1,n1,n2]
-            M_normed = self.inst_norm(M_batched).squeeze(1)  # [1,n1,n2] -> [n1,n2]
+            # affinity matrix + normalization + sinkhorn
+            sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
+            sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
+            sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
 
-            S = pygmtools.sinkhorn(M_normed, max_iter=self.max_iter, tau=self.tau)[0]
+            S = pygmtools.sinkhorn(sim_normed, max_iter=self.max_iter, tau=self.tau)[0]
             perm_pred_list.append(S)
             all_embeddings.append((h1_b, h2_b))
 
@@ -1378,11 +1382,11 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
             GATv2Conv(hidden_dim, out_dim, dropout=attention_dropout),
         ])
         self.dropout = nn.Dropout(p=dropout_emb)
-        # bilinear weight matrix A per affinity
-        std = 1.0 / math.sqrt(out_dim)
-        self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
-        # temperature per affinities
-        self.temperature = temperature
+        # # bilinear weight matrix A per affinity
+        # std = 1.0 / math.sqrt(out_dim)
+        # self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
+        # # temperature per affinities
+        # self.temperature = temperature
         # InstanceNorm per-sample
         self.inst_norm = nn.InstanceNorm2d(1, affine=True)
         # Sinkhorn hyperparams
@@ -1397,7 +1401,7 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
                 x = self.dropout(x)
         return x
 
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None):
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
 
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
@@ -1418,30 +1422,38 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
             h2_b = h2[batch_idx2 == b]   # [n2, d]
             N1, N2 = h1_b.size(0), h2_b.size(0)
 
-            # ---- bilinear affinity ----
-            # scores_{ij} = (h1_b @ A @ h2_b.T) / temperature
-            scores = (h1_b @ self.A) @ h2_b.T
-            M = torch.exp(scores / self.temperature)  # [n1, n2]
+            # # ---- bilinear affinity ----
+            # # scores_{ij} = (h1_b @ A @ h2_b.T) / temperature
+            # scores = (h1_b @ self.A) @ h2_b.T
+            # M = torch.exp(scores / self.temperature)  # [n1, n2]
+            # # normalize and sinkhorn
+            # M_batched = M.unsqueeze(0).unsqueeze(1)  # [1,1,n1,n2]
+            # M_normed = self.inst_norm(M_batched).squeeze(1)  # [1,n1,n2] -> [n1,n2]
 
-            # normalize and sinkhorn
-            M_batched = M.unsqueeze(0).unsqueeze(1)  # [1,1,n1,n2]
-            M_normed = self.inst_norm(M_batched).squeeze(1)  # [1,n1,n2] -> [n1,n2]
+            # affinity matrix + normalization + sinkhorn
+            sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
+            sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
+            sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
 
             n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
             n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
-            S = pygmtools.sinkhorn(M_normed, n1=n1_t, n2=n2_t, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
+            S = pygmtools.sinkhorn(sim_normed, n1=n1_t, n2=n2_t, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
             
             ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
             
-            _, soft_S = soft_topk(
+            hard_S, soft_S = soft_topk(
                 S, ks_gt,
                 max_iter=self.sinkhorn_max_iter,
                 tau=self.sinkhorn_tau,
                 nrows=n1_t, ncols=n2_t,
                 return_prob=True
             )
-            
-            perm_pred_list.append(soft_S[0])
+
+            if self.training:
+                perm_pred_list.append(soft_S[0])
+            elif inference:
+                perm_pred_list.append(hard_S[0])
+
             all_embeddings.append((h1_b, h2_b))
 
         return perm_pred_list, all_embeddings
@@ -1467,7 +1479,6 @@ def objective_gm(trial, train_dataset, val_dataset, path):
     num_layers   = trial.suggest_int("num_layers",       1,   3)
     sinkhorn_tau = trial.suggest_loguniform("tau",      1e-3, 1e-1)
     max_iter     = trial.suggest_int("max_iter",        10, 100)
-    temperature  = trial.suggest_loguniform("temperature", 1e-2, 1e1)
 
     # dataloader
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching)
@@ -1475,7 +1486,7 @@ def objective_gm(trial, train_dataset, val_dataset, path):
 
     # modello
     class MatchingModel(nn.Module):
-        def __init__(self,dropout, hidden_dim, out_dim, heads, attn_dropout, num_layers, sinkhorn_tau, max_iter, temperature):
+        def __init__(self,dropout, hidden_dim, out_dim, heads, attn_dropout, num_layers, sinkhorn_tau, max_iter):
             super().__init__()
             self.gnn = nn.ModuleList()
             dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
@@ -1486,10 +1497,12 @@ def objective_gm(trial, train_dataset, val_dataset, path):
                             heads=heads, concat=False,
                             dropout=attn_dropout))
             self.dropout = dropout
-            # bilinear weight matrix A per affinity
-            std = 1.0 / math.sqrt(out_dim)
-            self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
-            self.temperature = temperature
+            # # bilinear weight matrix A per affinity
+            # std = 1.0 / math.sqrt(out_dim)
+            # self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
+            # self.temperature = temperature
+            # InstanceNorm per-sample
+            self.inst_norm = nn.InstanceNorm2d(1, affine=True)
             self.tau = sinkhorn_tau
             self.max_iter = max_iter
 
@@ -1501,7 +1514,7 @@ def objective_gm(trial, train_dataset, val_dataset, path):
                     x = F.dropout(x, p=self.dropout, training=self.training)
             return x
 
-        def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None):
+        def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None, inference=False):
             device = next(self.parameters()).device
             x1, e1 = batch1.x.to(device), batch1.edge_index.to(device)
             x2, e2 = batch2.x.to(device), batch2.edge_index.to(device)
@@ -1518,16 +1531,12 @@ def objective_gm(trial, train_dataset, val_dataset, path):
                 h1_b = h1[batch_idx1==b]
                 h2_b = h2[batch_idx2==b]
 
-                # ---- bilinear affinity ----
-                # scores_{ij} = (h1_b @ A @ h2_b.T) / temperature
-                scores = (h1_b @ self.A) @ h2_b.T
-                M = torch.exp(scores / self.temperature)  # [n1, n2]
+                # affinity matrix + normalization + sinkhorn
+                sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
+                sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
+                sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
 
-                # normalize and sinkhorn
-                M_batched = M.unsqueeze(0).unsqueeze(1)  # [1,1,n1,n2]
-                M_normed = self.inst_norm(M_batched).squeeze(1)  # [1,n1,n2] -> [n1,n2]
-
-                S = pygmtools.sinkhorn(M_normed, tau=self.tau, max_iter=self.max_iter)[0]
+                S = pygmtools.sinkhorn(sim_normed, tau=self.tau, max_iter=self.max_iter)[0]
                 loss = loss + bce_permutation_loss(S, perm_list[b])
             return loss / B
 
@@ -1539,8 +1548,7 @@ def objective_gm(trial, train_dataset, val_dataset, path):
         attn_dropout=attn_dropout,
         num_layers=num_layers,
         sinkhorn_tau=sinkhorn_tau,
-        max_iter=max_iter,
-        temperature=temperature
+        max_iter=max_iter
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -1598,7 +1606,6 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
     max_iter     = trial.suggest_int("max_iter",        10, 100)
     tau          = trial.suggest_loguniform("tau",      1e-3, 1e-1)
     num_layers   = trial.suggest_int("num_layers",       1, 3)
-    temperature  = trial.suggest_loguniform("temperature", 1e-2, 1e1)
     heads        = trial.suggest_int("heads",           1,   4)
 
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching)
@@ -1607,7 +1614,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
     # Flexible model for partial matching
     class MatchingModel_GATv2SinkhornTopK_OPT(nn.Module):
         def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter, sinkhorn_tau,
-                    attention_dropout, dropout_emb, num_layers, temperature, heads):
+                    attention_dropout, dropout_emb, num_layers, heads):
             super().__init__()
             self.gnn = nn.ModuleList()
             dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
@@ -1618,10 +1625,10 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
                             heads=heads, concat=False,
                             dropout=attention_dropout))
             self.dropout = nn.Dropout(p=dropout_emb)
-            # bilinear weight matrix A per affinity
-            std = 1.0 / math.sqrt(out_dim)
-            self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
-            self.temperature = temperature
+            # # bilinear weight matrix A per affinity
+            # std = 1.0 / math.sqrt(out_dim)
+            # self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
+            # self.temperature = temperature
             # InstanceNorm per-sample
             self.inst_norm = nn.InstanceNorm2d(1, affine=True)
             self.sinkhorn_max_iter = sinkhorn_max_iter
@@ -1635,7 +1642,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
                     x = self.dropout(x)
             return x
 
-        def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None):
+        def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None, inference=False):
             device = next(self.parameters()).device
             x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
             x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
@@ -1653,18 +1660,14 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
                 h1_b = h1[batch_idx1 == b]
                 h2_b = h2[batch_idx2 == b]
 
-                # ---- bilinear affinity ----
-                # scores_{ij} = (h1_b @ A @ h2_b.T) / temperature
-                scores = (h1_b @ self.A) @ h2_b.T
-                M = torch.exp(scores / self.temperature)  # [n1, n2]
-
-                # normalize and sinkhorn
-                M_batched = M.unsqueeze(0).unsqueeze(1)  # [1,1,n1,n2]
-                M_normed = self.inst_norm(M_batched).squeeze(1)  # [1,n1,n2] -> [n1,n2]
+                # affinity matrix + normalization + sinkhorn
+                sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
+                sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
+                sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
 
                 n1 = torch.tensor([h1_b.size(0)], dtype=torch.int32, device=device)
                 n2 = torch.tensor([h2_b.size(0)], dtype=torch.int32, device=device)
-                S = pygmtools.sinkhorn(M_normed, n1=n1, n2=n2, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
+                S = pygmtools.sinkhorn(sim_normed, n1=n1, n2=n2, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
 
                 ks_gt = torch.tensor([h2_b.size(0)], dtype=torch.long, device=device)
 
@@ -1684,7 +1687,6 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
         attention_dropout=attn_dropout,
         dropout_emb=dropout_emb,
         num_layers=num_layers,
-        temperature=temperature,
         heads=heads
     ).to(device)
 
