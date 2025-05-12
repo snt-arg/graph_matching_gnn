@@ -1736,7 +1736,6 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
 # ## XAI
 
 # %%
-
 #----------------------------------------
 #            XAI UTILS
 #----------------------------------------
@@ -3144,22 +3143,6 @@ plot_two_graphs_with_matching(
     path=os.path.join(models_path, "test.png")
 )
 
-# %%
-#param opt 
-study = optuna.create_study(direction="minimize")
-study.optimize(lambda trial: objective_gm(trial, train_dataset, val_dataset, models_path), n_trials=30)
-print("Best hyperparameters: ", study.best_params)
-print("Best trial: ", study.best_trial)
-print("Best value: ", study.best_value)
-# Save the study
-with open(os.path.join(models_path, "study.pkl"), "wb") as f:
-    pickle.dump(study, f)
-# # Load the study
-# with open(os.path.join(models_path, "study.pkl"), "rb") as f:
-#     study = pickle.load(f)
-# Plot the study
-# optuna.visualization.plot_optimization_history(study).show()
-
 # %% [markdown]
 # # Partial graph matching
 
@@ -3427,22 +3410,6 @@ plot_two_graphs_with_matching(
     path=os.path.join(models_path, "test.png")
 )
 
-# %%
-#param opt 
-study = optuna.create_study(direction="minimize")
-study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset,models_path), n_trials=30)
-print("Best hyperparameters: ", study.best_params)
-print("Best trial: ", study.best_trial)
-print("Best value: ", study.best_value)
-# Save the study
-with open(os.path.join(models_path, "study.pkl"), "wb") as f:
-    pickle.dump(study, f)
-# # Load the study
-# with open(os.path.join(models_path, "study.pkl"), "rb") as f:
-#     study = pickle.load(f)
-# Plot the study
-# optuna.visualization.plot_optimization_history(study).show()
-
 # %% [markdown]
 # ## Room dropout equal
 
@@ -3706,21 +3673,5 @@ plot_two_graphs_with_matching(
     match_display="wrong",
     path=os.path.join(models_path, "test.png")
 )
-
-# %%
-#param opt 
-study = optuna.create_study(direction="minimize")
-study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset,models_path), n_trials=30)
-print("Best hyperparameters: ", study.best_params)
-print("Best trial: ", study.best_trial)
-print("Best value: ", study.best_value)
-# Save the study
-with open(os.path.join(models_path, "study.pkl"), "wb") as f:
-    pickle.dump(study, f)
-# # Load the study
-# with open(os.path.join(models_path, "study.pkl"), "rb") as f:
-#     study = pickle.load(f)
-# Plot the study
-# optuna.visualization.plot_optimization_history(study).show()
 
 

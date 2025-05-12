@@ -82,16 +82,6 @@ import json
 import pygmtools
 pygmtools.BACKEND = 'pytorch'
 
-destination_dir = os.path.join('AFAT')
-
-# Ensure the destination directory is in sys.path
-if destination_dir not in sys.path:
-    sys.path.append(destination_dir)
-
-# AFA-U inlier predictor and Top-K matching from AFAT
-from k_pred_net import Encoder as AFAUEncoder
-from sinkhorn_topk import soft_topk
-
 # %%
 # Set Seed for reproducibility
 seed = 42
@@ -119,27 +109,28 @@ g.manual_seed(seed)
 #            PARAMETERS OPTIMIZATION
 #----------------------------------------
 
-def objective_pgm(trial, train_dataset, val_dataset, path):
+def objective_gm(trial, train_dataset, val_dataset, path):
+    # iperparametri da esplorare
     lr           = trial.suggest_loguniform("lr", 1e-4, 1e-2)
     weight_decay = 5e-5
-    dropout_emb  = trial.suggest_uniform("dropout", 0.0, 0.6)
+    dropout      = trial.suggest_uniform("dropout", 0.0, 0.6)
     hidden_dim   = trial.suggest_categorical("hidden_dim", [32, 64, 128])
     out_dim      = trial.suggest_categorical("out_dim",    [16, 32, 64])
     batch_size   = trial.suggest_categorical("batch_size", [8, 16, 32])
-    attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
-    sinkhorn_max_iter = 15
-    sinkhorn_tau = 0.1
-    num_layers   = trial.suggest_int("num_layers",       1, 3)
     heads        = trial.suggest_int("heads",           1,   4)
+    attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
+    num_layers   = trial.suggest_int("num_layers",       1,   3)
+    sinkhorn_tau = 1
+    max_iter     = 10
+    in_dim = train_dataset[0][0].x.size(1)
 
+    # dataloader
     train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching)
-    val_loader   = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+    val_loader   = DataLoader(val_dataset,   batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
-
-    # Flexible model for partial matching
-    class MatchingModel_GATv2SinkhornTopK_OPT(nn.Module):
-        def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter, sinkhorn_tau,
-                    attention_dropout, dropout_emb, num_layers, heads):
+    # modello
+    class MatchingModel(nn.Module):
+        def __init__(self,in_dim, dropout, hidden_dim, out_dim, heads, attn_dropout, num_layers, sinkhorn_tau, max_iter):
             super().__init__()
             self.gnn = nn.ModuleList()
             dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
@@ -148,85 +139,77 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
                 self.gnn.append(
                 GATv2Conv(dims[i], dims[i+1],
                             heads=heads, concat=False,
-                            dropout=attention_dropout))
-            self.dropout = nn.Dropout(p=dropout_emb)
+                            dropout=attn_dropout))
+            self.dropout = dropout
             # # bilinear weight matrix A per affinity
             # std = 1.0 / math.sqrt(out_dim)
             # self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
             # self.temperature = temperature
             # InstanceNorm per-sample
             self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-            self.sinkhorn_max_iter = sinkhorn_max_iter
-            self.sinkhorn_tau = sinkhorn_tau
+            self.tau = sinkhorn_tau
+            self.max_iter = max_iter
 
         def encode(self, x, edge_index):
             for i, conv in enumerate(self.gnn):
                 x = conv(x, edge_index)
-                if i < len(self.gnn) - 1:
+                if i < len(self.gnn)-1:
                     x = F.relu(x)
-                    x = self.dropout(x)
+                    x = F.dropout(x, p=self.dropout, training=self.training)
             return x
 
         def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None, inference=False):
             device = next(self.parameters()).device
-            x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
-            x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+            x1, e1 = batch1.x.to(device), batch1.edge_index.to(device)
+            x2, e2 = batch2.x.to(device), batch2.edge_index.to(device)
             perm_list = [p.to(device) for p in perm_list]
-
-            batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
-            batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-
-            h1 = self.encode(x1, edge1)
-            h2 = self.encode(x2, edge2)
-
-            B = batch_idx1.max().item() + 1
-            loss = 0.0
+            
+            if batch_idx1 is None:
+                batch_idx1 = batch1.batch.to(device)
+                batch_idx2 = batch2.batch.to(device)
+            h1 = self.encode(x1, e1)
+            h2 = self.encode(x2, e2)
+            B = batch_idx1.max().item()+1
+            loss = 0
             for b in range(B):
-                h1_b = h1[batch_idx1 == b]
-                h2_b = h2[batch_idx2 == b]
+                h1_b = h1[batch_idx1==b]
+                h2_b = h2[batch_idx2==b]
 
                 # affinity matrix + normalization + sinkhorn
                 sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
                 sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
                 sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
 
-                n1 = torch.tensor([h1_b.size(0)], dtype=torch.int32, device=device)
-                n2 = torch.tensor([h2_b.size(0)], dtype=torch.int32, device=device)
-                S = pygmtools.sinkhorn(sim_normed, n1=n1, n2=n2, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
-
-                ks_gt = torch.tensor([h2_b.size(0)], dtype=torch.long, device=device)
-
-                _, soft_S = soft_topk(S, ks_gt, max_iter=self.sinkhorn_max_iter,
-                                    tau=self.sinkhorn_tau, nrows=n1, ncols=n2,
-                                    return_prob=True)
-
-                loss += bce_permutation_loss(soft_S[0], perm_list[b])
+                S = pygmtools.sinkhorn(sim_normed, tau=self.tau, max_iter=self.max_iter)[0]
+                loss = loss + bce_permutation_loss(S, perm_list[b])
             return loss / B
 
-    model = MatchingModel_GATv2SinkhornTopK_OPT(
-        in_dim=train_dataset[0][0].x.size(1),
+    model = MatchingModel(
+        in_dim=in_dim,
+        dropout=dropout,
         hidden_dim=hidden_dim,
         out_dim=out_dim,
-        sinkhorn_max_iter=sinkhorn_max_iter,
-        sinkhorn_tau=sinkhorn_tau,
-        attention_dropout=attn_dropout,
-        dropout_emb=dropout_emb,
+        heads=heads,
+        attn_dropout=attn_dropout,
         num_layers=num_layers,
-        heads=heads
+        sinkhorn_tau=sinkhorn_tau,
+        max_iter=max_iter
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
 
+    # training rapido con early stopping
     best_val = float('inf')
     counter = 0
     for epoch in range(30):
+        # train
         model.train()
         for b1, b2, perm in train_loader:
             optimizer.zero_grad()
             loss = model(b1, b2, perm)
             loss.backward()
             optimizer.step()
-
+        # validate
         model.eval()
         val_loss = 0
         with torch.no_grad():
@@ -243,7 +226,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
             counter += 1
             if counter >= 5:
                 break
-
+    
     # save best trial info
     if trial.number == 0 or best_val <= trial.study.best_value:
         result = {
@@ -306,8 +289,8 @@ print("Loading dataset...")
 
 #load preprocessed dataset
 gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
-gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_noise")
-models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "room_dropout_noise")
+gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "global_local")
+models_path = os.path.join(GNN_PATH, 'models', 'graph_matching', 'global_local')
 
 original_graphs = deserialize_graph_matching_dataset(
     gm_equal_preprocessed_path,
@@ -339,7 +322,7 @@ print("Starting hyperparameter optimization...")
 
 #param opt 
 study = optuna.create_study(direction="minimize")
-study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset, models_path), n_trials=30)
+study.optimize(lambda trial: objective_gm(trial, train_dataset, val_dataset, models_path), n_trials=30)
 # Save the study
 with open(os.path.join(models_path, "study.pkl"), "wb") as f:
     pickle.dump(study, f)
