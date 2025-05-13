@@ -1292,11 +1292,11 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
 in_dim = 7
 hidden_dim = 64
 out_dim = 32
-num_epochs = 200
+num_epochs = 100
 learning_rate = 1e-3
 batch_size = 16
 weight_decay = 5e-5
-patience = 30
+patience = 10
 
 ###     GRAPH MATCHING MODEL
 class MatchingModel_GATv2Sinkhorn(nn.Module):
