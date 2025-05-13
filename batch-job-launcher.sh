@@ -1,8 +1,9 @@
 #!/bin/bash -l
 #SBATCH -c 1
-#SBATCH --time=0-06:00:00
+#SBATCH --time=0-48:00:00
 #SBATCH -p gpu
-#SBATCH --gres=gpu:1 
+#SBATCH --gres=gpu:volta:1
+#SBATCH --constraint=volta32 
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=matteogiorgi196@gmail.com
 
