@@ -10,7 +10,8 @@ import subprocess
 import sys
 
 # Install required packages
-subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard"])
+subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas",
+                        "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
 
 # Check if pygmtools is installed
 try:
@@ -114,9 +115,9 @@ def objective_gm(trial, train_dataset, val_dataset, path):
     lr           = trial.suggest_loguniform("lr", 1e-4, 1e-2)
     weight_decay = 5e-5
     dropout      = trial.suggest_uniform("dropout", 0.0, 0.6)
-    hidden_dim   = trial.suggest_categorical("hidden_dim", [32, 64, 128])
-    out_dim      = trial.suggest_categorical("out_dim",    [16, 32, 64])
-    batch_size   = trial.suggest_categorical("batch_size", [8, 16, 32])
+    hidden_dim   = 64
+    out_dim      = 32
+    batch_size   = 16
     heads        = trial.suggest_int("heads",           1,   4)
     attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
     num_layers   = trial.suggest_int("num_layers",       1,   3)
@@ -331,4 +332,5 @@ with open(os.path.join(models_path, "study.pkl"), "wb") as f:
 #     study = pickle.load(f)
 # Plot the study
 fig = optuna.visualization.plot_optimization_history(study)
-fig.write_html(os.path.join(models_path, "opt_history.png"))
+fig.write_html(os.path.join(models_path, "opt_history.html"))
+fig.write_image(os.path.join(models_path, "opt_history.png"))

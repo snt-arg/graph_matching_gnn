@@ -45,7 +45,17 @@ python3 -c "import torch; print('CUDA available:', torch.cuda.is_available()); p
 
 # Esecuzione script Python
 echo "Launching Python script..."
-# python3 graph_matching.py
-# python3 optimization_gm.py
+# python3 dataset_gen.py
+# python3 graph_matching_train.py 
+# python3 partial_graph_matching_train.py 
+# python3 optimization_gm.py 
+# python3 optimization_ws.py 
+# python3 optimization_room.py 
+
+
+
+
+
+
 python3 optimization_ws.py
 echo "=== SLURM JOB ENDED ==="
