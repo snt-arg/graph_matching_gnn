@@ -1,9 +1,8 @@
 #!/bin/bash -l
 #SBATCH -c 1
-#SBATCH --time=0-10:00:00
+#SBATCH --time=0-06:00:00
 #SBATCH -p gpu
-#SBATCH --gres=gpu:volta:1
-#SBATCH --constraint=volta32
+#SBATCH --gres=gpu:1 
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=matteogiorgi196@gmail.com
 
@@ -45,17 +44,12 @@ python3 -c "import torch; print('CUDA available:', torch.cuda.is_available()); p
 
 # Esecuzione script Python
 echo "Launching Python script..."
-# python3 dataset_gen.py
-# python3 graph_matching_train.py 
-# python3 partial_graph_matching_train.py 
-# python3 optimization_gm.py 
-# python3 optimization_ws.py 
-# python3 optimization_room.py 
+# python3 -u dataset_gen.py
+# python3 -u graph_matching_train.py 
+# python3 -u partial_graph_matching_train.py 
+# python3 -u optimization_gm.py 
+# python3 -u optimization_ws.py 
+python3 -u optimization_room.py 
 
 
-
-
-
-
-python3 optimization_ws.py
 echo "=== SLURM JOB ENDED ==="
