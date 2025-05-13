@@ -128,8 +128,8 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
     out_dim      = 32
     batch_size   = 16
     attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
-    sinkhorn_max_iter = 15
-    sinkhorn_tau = 0.1
+    sinkhorn_max_iter = 10
+    sinkhorn_tau = 1.0
     num_layers   = trial.suggest_int("num_layers",       1, 3)
     heads        = trial.suggest_int("heads",           1,   4)
 

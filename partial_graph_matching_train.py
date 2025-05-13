@@ -1371,8 +1371,8 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         in_dim: int,
         hidden_dim: int,
         out_dim: int,
-        sinkhorn_max_iter: int = 15,
-        sinkhorn_tau: float = 0.1,
+        sinkhorn_max_iter: int = 10,
+        sinkhorn_tau: float = 1,
         attention_dropout: float = 0.1,
         dropout_emb: float = 0.1,
         temperature: float = 1.0
