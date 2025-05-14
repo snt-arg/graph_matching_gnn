@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH -c 1
-#SBATCH --time=0-12:00:00
+#SBATCH --time=0-32:00:00
 #SBATCH -p gpu
 #SBATCH --gres=gpu:volta:1
 #SBATCH --constraint=volta32 
