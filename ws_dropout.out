@@ -182,3 +182,10 @@ Starting hyperparameter optimization...
 [I 2025-05-14 14:11:12,389] Trial 1 finished with value: 0.0831254506888597 and parameters: {'lr': 0.00011873844161801733, 'dropout': 0.216181977246976, 'attn_dropout': 0.38400981475766977, 'num_layers': 1, 'heads': 2}. Best is trial 0 with value: 0.07986663168539172.
 [I 2025-05-14 17:14:22,495] Trial 2 finished with value: 0.08643980210889941 and parameters: {'lr': 0.007261659567202711, 'dropout': 0.41764523040448387, 'attn_dropout': 0.32175244639646, 'num_layers': 3, 'heads': 1}. Best is trial 0 with value: 0.07986663168539172.
 [I 2025-05-15 06:50:23,005] Trial 3 finished with value: 0.08298051826979803 and parameters: {'lr': 0.0026657578587368233, 'dropout': 0.5024682496198889, 'attn_dropout': 0.5961191457574723, 'num_layers': 2, 'heads': 3}. Best is trial 0 with value: 0.07986663168539172.
+[I 2025-05-15 13:06:05,812] Trial 4 finished with value: 0.07449859178260616 and parameters: {'lr': 0.0045070134727913, 'dropout': 0.527719183081031, 'attn_dropout': 0.12187801464523997, 'num_layers': 1, 'heads': 2}. Best is trial 4 with value: 0.07449859178260616.
+[I 2025-05-15 13:15:03,153] Trial 5 pruned. 
+[I 2025-05-15 13:27:21,380] Trial 6 pruned. 
+[I 2025-05-15 15:25:38,506] Trial 7 finished with value: 0.05839779632894889 and parameters: {'lr': 0.006994779584044511, 'dropout': 0.013876886224604078, 'attn_dropout': 0.05436420445577628, 'num_layers': 2, 'heads': 3}. Best is trial 7 with value: 0.05839779632894889.
+[I 2025-05-15 15:37:43,235] Trial 8 pruned. 
+[I 2025-05-15 16:00:53,517] Trial 9 pruned. 
+slurmstepd: error: *** JOB 4126457 ON iris-193 CANCELLED AT 2025-05-15T19:38:54 DUE TO TIME LIMIT ***
