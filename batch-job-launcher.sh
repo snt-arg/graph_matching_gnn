@@ -48,13 +48,13 @@ echo "Launching Python script..."
 # python3 -u dataset_gen.py
 
 # python3 -u graph_matching_train.py 
-python3 -u pgm_ws_equal.py 
+# python3 -u pgm_ws_equal.py 
 # python3 -u pgm_ws_noise.py
 # python3 -u pgm_room_equal.py
 # python3 -u pgm_room_noise.py
 
 # python3 -u optimization_gm.py 
 # python3 -u optimization_ws.py 
-# python3 -u optimization_room.py 
+python3 -u optimization_room.py 
 
 echo "=== SLURM JOB ENDED ==="
