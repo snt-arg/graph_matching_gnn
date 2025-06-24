@@ -2,8 +2,7 @@
 .venv/
 .ipynb_checkpoints/
 Colab Notebooks/
-GNN/
-GNN.zip
+graph_matching/GNN/
 slurm*
-preamble.py
-GNN.tar.bz2
+graph_matching/preamble.py
+graph_matching/GNN.tar.bz2
