@@ -1,9 +1,8 @@
 #!/bin/bash -l
 #SBATCH -c 1
-#SBATCH --time=0-32:00:00
+#SBATCH --time=0-6:00:00
 #SBATCH -p gpu
-#SBATCH --gres=gpu:volta:1
-#SBATCH --constraint=volta32 
+#SBATCH --gres=gpu:1 
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=matteogiorgi196@gmail.com
 
@@ -27,8 +26,8 @@ module load lang/Python/3.8.6-GCCcore-10.2.0
 
 # Attiva virtualenv
 echo "Activating virtualenv..."
-if [ -f ../../venv_aion/bin/activate ]; then
-  source ../../venv_aion/bin/activate
+if [ -f ../.venv/bin/activate ]; then
+  source ../.venv/bin/activate
 else
   echo "ERROR: Virtualenv not found at ../../venv_aion/bin/activate"
   exit 1
@@ -55,6 +54,7 @@ echo "Launching Python script..."
 
 # python3 -u optimization_gm.py 
 # python3 -u optimization_ws.py 
-python3 -u optimization_room.py 
+# python3 -u optimization_room.py 
+python3 -u embedding_debug.py 
 
 echo "=== SLURM JOB ENDED ==="
