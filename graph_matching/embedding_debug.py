@@ -1781,7 +1781,7 @@ def visualize(h, node_type_labels, graph_labels, epoch, node_type_filter: Option
     plt.close(fig)
     return arr
 
-def create_embedding_gif_stride(history, output_path, pair=0, fps=1, step=5, node_type_filter: Optional[Literal["room", "ws", "all"]] = "all"):
+def create_embedding_gif_stride(history, output_path, embedding_type, pair=0, fps=1, step=5, node_type_filter: Optional[Literal["room", "ws", "all"]] = "all"):
     plt.close('all')
     images = []
 
@@ -1789,7 +1789,7 @@ def create_embedding_gif_stride(history, output_path, pair=0, fps=1, step=5, nod
         h1, h2 = history[epoch][pair]
         h = torch.cat([h1, h2], dim=0)
 
-        node_types = get_node_type_labels(h)
+        node_types = embedding_type
         graph_labels = torch.cat([
             torch.zeros(h1.size(0), dtype=torch.long),
             torch.ones(h2.size(0), dtype=torch.long)
@@ -1845,6 +1845,8 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
     ax.legend(loc='best', frameon=True)
     plt.savefig(output_path, bbox_inches='tight', dpi=300)
     plt.close(fig)
+
+    return node_types
 
 # %% [markdown]
 # # Graph matching
@@ -1923,7 +1925,7 @@ batch = next(iter(val_loader))
 h1_val, h2_val = batch[0], batch[1]
 visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_room.png'), node_type_filter="room")
 visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_ws.png'), node_type_filter="ws")
-visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_all.png'), node_type_filter="all")
+embedding_type = visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_all.png'), node_type_filter="all")
 
 # %%
 train_losses, val_losses, val_embeddings_history = train_loop(
@@ -1940,9 +1942,9 @@ train_losses, val_losses, val_embeddings_history = train_loop(
 )
 
 # %%
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), fps=0.001, node_type_filter="all")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), fps=0.001, node_type_filter="room")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), fps=0.001, node_type_filter="ws")
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), embedding_type, fps=0.001, node_type_filter="all")
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), embedding_type, fps=0.001, node_type_filter="room")
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), embedding_type, fps=0.001, node_type_filter="ws")
 
 
 # %%
