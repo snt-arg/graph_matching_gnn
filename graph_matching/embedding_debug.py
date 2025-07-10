@@ -69,6 +69,9 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GATv2Conv, GCNConv
 
 from moviepy.editor import ImageSequenceClip
+from typing import Optional, Literal
+import numpy as np
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import optuna
 import json
 
@@ -1734,12 +1737,26 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
 #----------------------------------------
 #            XAI UTILS
 #----------------------------------------
-from typing import Optional, Literal
-
 def plt2arr(fig):
-    rgb_str = fig.canvas.tostring_rgb()
-    (w, h) = fig.canvas.get_width_height()
-    return np.frombuffer(rgb_str, dtype=np.uint8).reshape((h, w, -1))
+    """
+    Converts a matplotlib figure to a NumPy RGB array.
+    Ensures the canvas is drawn before reading pixel data.
+    """
+    # Attach a canvas if not already present
+    if fig.canvas is None or not isinstance(fig.canvas, FigureCanvas):
+        FigureCanvas(fig)
+
+    # Force the figure to render
+    fig.canvas.draw()
+
+    # Get the image from the buffer
+    buf = fig.canvas.buffer_rgba()
+    img = np.asarray(buf)
+
+    # Remove the alpha channel (RGBA -> RGB)
+    img_rgb = img[..., :3].copy()
+
+    return img_rgb
 
 def get_node_type_labels(h):
     if h.shape[1] < 2:
@@ -1781,7 +1798,7 @@ def visualize(h, node_type_labels, graph_labels, epoch, node_type_filter: Option
     plt.close(fig)
     return arr
 
-def create_embedding_gif_stride(history, output_path, pair=0, fps=1, step=5, node_type_filter: Optional[Literal["room", "ws", "all"]] = "all"):
+def create_embedding_gif_stride(history, output_path, embedding_type, pair=0, fps=1, step=5, node_type_filter: Optional[Literal["room", "ws", "all"]] = "all"):
     plt.close('all')
     images = []
 
@@ -1789,7 +1806,7 @@ def create_embedding_gif_stride(history, output_path, pair=0, fps=1, step=5, nod
         h1, h2 = history[epoch][pair]
         h = torch.cat([h1, h2], dim=0)
 
-        node_types = get_node_type_labels(h)
+        node_types = embedding_type
         graph_labels = torch.cat([
             torch.zeros(h1.size(0), dtype=torch.long),
             torch.ones(h2.size(0), dtype=torch.long)
@@ -1845,6 +1862,8 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
     ax.legend(loc='best', frameon=True)
     plt.savefig(output_path, bbox_inches='tight', dpi=300)
     plt.close(fig)
+
+    return node_types
 
 # %% [markdown]
 # # Graph matching
@@ -1923,7 +1942,7 @@ batch = next(iter(val_loader))
 h1_val, h2_val = batch[0], batch[1]
 visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_room.png'), node_type_filter="room")
 visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_ws.png'), node_type_filter="ws")
-visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_all.png'), node_type_filter="all")
+embedding_type = visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_all.png'), node_type_filter="all")
 
 # %%
 train_losses, val_losses, val_embeddings_history = train_loop(
@@ -1940,9 +1959,9 @@ train_losses, val_losses, val_embeddings_history = train_loop(
 )
 
 # %%
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), fps=0.001, node_type_filter="all")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), fps=0.001, node_type_filter="room")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), fps=0.001, node_type_filter="ws")
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), embedding_type, fps=0.001, node_type_filter="all")
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), embedding_type, fps=0.001, node_type_filter="room")
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), embedding_type, fps=0.001, node_type_filter="ws")
 
 
 # %%
