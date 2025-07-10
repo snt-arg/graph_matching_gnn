@@ -13,12 +13,6 @@ import sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas",
                         "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
 
-# Check if pygmtools is installed
-try:
-    import pygmtools
-except ImportError:#pygmtools library
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"])
-
 # Check pytorch version and make sure you use a GPU Kernel
 import torch
 print("PyTorch version:", torch.__version__)
@@ -1294,7 +1288,7 @@ hidden_dim = 64
 out_dim = 32
 num_epochs = 200
 learning_rate = 1e-3
-batch_size = 16
+batch_size = 1
 weight_decay = 5e-5
 patience = 30
 
@@ -1801,6 +1795,9 @@ def create_embedding_gif_stride(history, output_path, pair=0, fps=1, step=5, nod
             torch.ones(h2.size(0), dtype=torch.long)
         ], dim=0)
 
+        graph_labels = graph_labels.to(device)
+        node_types = node_types.to(device)
+        
         images.append(visualize(h, node_types, graph_labels, epoch, node_type_filter=node_type_filter))
 
     clip = ImageSequenceClip(images, fps=fps)
@@ -1814,6 +1811,9 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
         torch.zeros(h1.size(0), dtype=torch.long),
         torch.ones(h2.size(0), dtype=torch.long)
     ], dim=0)
+
+    graph_labels = graph_labels.to(device)
+    node_types = node_types.to(device)
 
     fig, ax = plt.subplots(figsize=(10, 10), frameon=False)
     z = TSNE(2, random_state=42, init='pca').fit_transform(h.cpu().numpy())
@@ -1987,7 +1987,7 @@ std_inference_time = np.std(inference_times)
 print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
 
 # %%
-g1_out, g2_perm, gt_perm = val_list[25]
+g1_out, g2_perm, gt_perm = val_list[0]
 result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
 
 plot_two_graphs_with_matching(
