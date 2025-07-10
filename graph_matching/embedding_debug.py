@@ -69,6 +69,9 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GATv2Conv, GCNConv
 
 from moviepy.editor import ImageSequenceClip
+from typing import Optional, Literal
+import numpy as np
+from matplotlib.backends.backend_agg import FigureCanvasAgg as FigureCanvas
 import optuna
 import json
 
@@ -1734,12 +1737,26 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
 #----------------------------------------
 #            XAI UTILS
 #----------------------------------------
-from typing import Optional, Literal
-
 def plt2arr(fig):
-    rgb_str = fig.canvas.tostring_rgb()
-    (w, h) = fig.canvas.get_width_height()
-    return np.frombuffer(rgb_str, dtype=np.uint8).reshape((h, w, -1))
+    """
+    Converts a matplotlib figure to a NumPy RGB array.
+    Ensures the canvas is drawn before reading pixel data.
+    """
+    # Attach a canvas if not already present
+    if fig.canvas is None or not isinstance(fig.canvas, FigureCanvas):
+        FigureCanvas(fig)
+
+    # Force the figure to render
+    fig.canvas.draw()
+
+    # Get the image from the buffer
+    buf = fig.canvas.buffer_rgba()
+    img = np.asarray(buf)
+
+    # Remove the alpha channel (RGBA -> RGB)
+    img_rgb = img[..., :3].copy()
+
+    return img_rgb
 
 def get_node_type_labels(h):
     if h.shape[1] < 2:
