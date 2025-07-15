@@ -1,6 +1,6 @@
 #!/bin/bash -l
 #SBATCH -c 1
-#SBATCH --time=0-6:00:00
+#SBATCH --time=0-32:00:00
 #SBATCH -p gpu
 #SBATCH --gres=gpu:1 
 #SBATCH --mail-type=END,FAIL
@@ -54,7 +54,7 @@ echo "Launching Python script..."
 
 # python3 -u optimization_gm.py 
 # python3 -u optimization_ws.py 
-# python3 -u optimization_room.py 
-python3 -u embedding_debug.py 
+python3 -u optimization_room.py 
+# python3 -u embedding_debug.py 
 
 echo "=== SLURM JOB ENDED ==="
