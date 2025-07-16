@@ -48,6 +48,7 @@ import pickle
 import random
 import time
 import math
+import ast
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 from datetime import datetime
@@ -958,7 +959,7 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
         optimizer.zero_grad()
         batch_idx1 = batch1.batch
         batch_idx2 = batch2.batch
-        pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
+        pred_perm_list, batch_embeddings = model(batch1, batch2, perm_list, batch_idx1, batch_idx2)
 
         # accumulo loss per grafo
         batch_loss = 0.0
@@ -1004,7 +1005,7 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
 
             batch_idx1 = batch1.batch
             batch_idx2 = batch2.batch
-            pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
+            pred_perm_list, batch_embeddings = model(batch1, batch2, perm_list, batch_idx1, batch_idx2)
 
             for P, P_gt in zip(pred_perm_list, perm_list):
                 # accuracy
@@ -1328,11 +1329,12 @@ class MatchingModel_GATv2Sinkhorn(nn.Module):
                 x = self.dropout(x)
         return x
 
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False):
+    def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
 
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+        perm_list = [p.to(device) for p in perm_list]
 
         batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
         batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
@@ -1937,7 +1939,22 @@ test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, col
 # Load best hyperparameters
 best_params_path = os.path.join("output", "ws_noise_params.out")
 with open(best_params_path, "r") as f:
-    best_params = eval(f.read().strip().split("Best hyperparameters: ")[-1])
+    content = f.read()
+
+# Isola il pezzo tra "Best hyperparameters:  {" e la parentesi graffa di chiusura
+start = content.find("Best hyperparameters:  {")
+if start == -1:
+    raise ValueError("Best hyperparameters not found in the file.")
+
+start += len("Best hyperparameters:  ")
+end = content.find("}", start) + 1  # include la graffa di chiusura
+
+hyperparams_str = content[start:end]
+
+# Usa ast.literal_eval per maggiore sicurezza rispetto a eval()
+best_params = ast.literal_eval(hyperparams_str)
+
+# Ora puoi accedere ai parametri
 learning_rate = best_params['lr']
 weight_decay = best_params['weight_decay']
 hidden_dim = best_params['hidden_dim']
@@ -1947,6 +1964,8 @@ dropout_emb = best_params['dropout_emb']
 attn_dropout = best_params['attn_dropout']
 num_layers = best_params['num_layers']
 heads = best_params['heads']
+sinkhorn_max_iter = 10
+sinkhorn_tau = 1
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2SinkhornTopK(
@@ -1956,7 +1975,9 @@ model = MatchingModel_GATv2SinkhornTopK(
     attention_dropout=attn_dropout,
     dropout_emb=dropout_emb,
     num_layers=num_layers,
-    heads=heads
+    heads=heads,
+    sinkhorn_max_iter=sinkhorn_max_iter,
+    sinkhorn_tau=sinkhorn_tau
 ).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
@@ -1971,6 +1992,13 @@ writer = setup_tb_logger(
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+
+# visualize initial validation embeddings
+batch = next(iter(val_loader))
+h1_val, h2_val = batch[0], batch[1]
+visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_room.png'), node_type_filter="room")
+visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_ws.png'), node_type_filter="ws")
+embedding_type = visualize_initial_embeddings(h1_val.x, h2_val.x, os.path.join(models_path, 'initial_all.png'), node_type_filter="all")
 
 # %%
 train_losses, val_losses, val_embeddings_history = train_loop(
@@ -1987,7 +2015,9 @@ train_losses, val_losses, val_embeddings_history = train_loop(
 )
 
 # %%
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), fps=0.001)
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="all")
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="room")
+create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="ws")
 
 # %%
 plot_losses(train_losses, val_losses, os.path.join(models_path, 'losses.png'))
