@@ -1371,8 +1371,8 @@ class MatchingModel_GATv2Sinkhorn(nn.Module):
 
 ###     PARTIAL GRAPH MATCHING MODEL with MLP
 class MatchingModel_GATv2SinkhornTopK(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter, sinkhorn_tau,
-                attention_dropout, dropout_emb, num_layers, heads):
+    def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter: int = 10, sinkhorn_tau: float = 1.0,
+                 attention_dropout: float = 0.1, dropout_emb: float = 0.1, num_layers: int = 2, heads: int = 1):
         super().__init__()
         # MLP for initial node feature transformation
         self.mlp = nn.Sequential(
@@ -2013,11 +2013,6 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     patience=patience,
     resume=False
 )
-
-# %%
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="all")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="room")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="ws")
 
 # %%
 plot_losses(train_losses, val_losses, os.path.join(models_path, 'losses.png'))
