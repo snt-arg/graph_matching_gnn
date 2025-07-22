@@ -349,18 +349,27 @@ train_dataset = GraphMatchingDataset(train_list)
 val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
-print("Starting hyperparameter optimization...")
+print("Continuing hyperparameter optimization...")
 
-#param opt 
-study = optuna.create_study(direction="minimize")
+study_path = os.path.join(models_path, "study.pkl")
+
+# Load the previous study
+if os.path.exists(study_path):
+    with open(study_path, "rb") as f:
+        study = pickle.load(f)
+    print(f"Loaded existing study with {len(study.trials)} trials.")
+else:
+    print("No existing study found, starting a new one.")
+    study = optuna.create_study(direction="minimize")
+
+# Continue optimizing (or start from scratch if no study existed)
 study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset, models_path), n_trials=30)
-# Save the study
-with open(os.path.join(models_path, "study.pkl"), "wb") as f:
+
+# Save the updated study
+with open(study_path, "wb") as f:
     pickle.dump(study, f)
-# # Load the study
-# with open(os.path.join(models_path, "study.pkl"), "rb") as f:
-#     study = pickle.load(f)
-# Plot the study
+
+# Plot the study results
 fig = optuna.visualization.plot_optimization_history(study)
 fig.write_html(os.path.join(models_path, "opt_history.html"))
 fig.write_image(os.path.join(models_path, "opt_history.png"))
