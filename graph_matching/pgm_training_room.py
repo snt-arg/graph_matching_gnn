@@ -1937,24 +1937,13 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Load best hyperparameters
-best_params_path = os.path.join("output", "room_noise_params.out")
-with open(best_params_path, "r") as f:
-    content = f.read()
+study_path = os.path.join(models_path, 'study.pkl')
 
-# Isola il pezzo tra "Best hyperparameters:  {" e la parentesi graffa di chiusura
-start = content.find("Best hyperparameters:  {")
-if start == -1:
-    raise ValueError("Best hyperparameters not found in the file.")
+with open(study_path, 'rb') as f:
+    study = pickle.load(f)
 
-start += len("Best hyperparameters:  ")
-end = content.find("}", start) + 1  # include la graffa di chiusura
+best_params = study.best_trial.params
 
-hyperparams_str = content[start:end]
-
-# Usa ast.literal_eval per maggiore sicurezza rispetto a eval()
-best_params = ast.literal_eval(hyperparams_str)
-
-# Ora puoi accedere ai parametri
 learning_rate = best_params['lr']
 weight_decay = best_params['weight_decay']
 hidden_dim = best_params['hidden_dim']

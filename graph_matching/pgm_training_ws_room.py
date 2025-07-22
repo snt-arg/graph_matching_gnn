@@ -1934,9 +1934,13 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Load best hyperparameters
-best_params_path = os.path.join("output", "ws_room_noise_params.out")
-with open(best_params_path, "r") as f:
-    best_params = eval(f.read().strip().split("Best hyperparameters: ")[-1])
+study_path = os.path.join(models_path, 'study.pkl')
+
+with open(study_path, 'rb') as f:
+    study = pickle.load(f)
+
+best_params = study.best_trial.params
+
 learning_rate = best_params['lr']
 weight_decay = best_params['weight_decay']
 hidden_dim = best_params['hidden_dim']
@@ -1946,6 +1950,8 @@ dropout_emb = best_params['dropout_emb']
 attn_dropout = best_params['attn_dropout']
 num_layers = best_params['num_layers']
 heads = best_params['heads']
+sinkhorn_max_iter = 10
+sinkhorn_tau = 1
 
 # Modello e ottimizzatore
 model = MatchingModel_GATv2SinkhornTopK(
