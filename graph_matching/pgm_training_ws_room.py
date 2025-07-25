@@ -1040,7 +1040,7 @@ def predict_matching_matrix(model, data1, data2, use_hungarian: bool = True):
         batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
         batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
 
-        sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2, inference=True)
+        sim_matrix_list, _ = model(data1, data2, batch_idx1=batch_idx1, batch_idx2=batch_idx2, inference=True)
         sim = sim_matrix_list[0].unsqueeze(0)  # [1, N1, N2]
 
         n1 = torch.tensor([sim.shape[1]], dtype=torch.int32, device=device)
@@ -1329,12 +1329,12 @@ class MatchingModel_GATv2Sinkhorn(nn.Module):
                 x = self.dropout(x)
         return x
 
-    def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None, inference=False):
+    def forward(self, batch1, batch2, perm_list=None, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
 
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-        perm_list = [p.to(device) for p in perm_list]
+        perm_list = [p.to(device) for p in perm_list] if perm_list is not None else None
 
         batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
         batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
@@ -1410,11 +1410,11 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
                 x = self.dropout(x)
         return x
 
-    def forward(self, batch1, batch2, perm_list, batch_idx1=None, batch_idx2=None, inference=False):
+    def forward(self, batch1, batch2, perm_list=None, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-        perm_list = [p.to(device) for p in perm_list]
+        perm_list = [p.to(device) for p in perm_list] if perm_list is not None else None
 
         batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
         batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
