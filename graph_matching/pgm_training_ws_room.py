@@ -2036,6 +2036,9 @@ for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     # Accuracy calculation after hungarian
     pred_idx = result.argmax(dim=0)
     target_idx = gt_perm.argmax(dim=0)
+    # Ensure both tensors are on the same device before comparison
+    pred_idx = pred_idx.to(gt_perm.device)
+    target_idx = target_idx.to(gt_perm.device)
     correct += (pred_idx == target_idx).sum().item()
     total_cols += result.shape[1]
 
