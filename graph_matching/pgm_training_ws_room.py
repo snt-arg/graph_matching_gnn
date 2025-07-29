@@ -1297,7 +1297,7 @@ hidden_dim = 64
 out_dim = 32
 num_epochs = 500
 learning_rate = 1e-3
-batch_size = 1
+batch_size = 16
 weight_decay = 5e-5
 patience = 100
 
@@ -1880,6 +1880,9 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
     return node_types
 
 # %% [markdown]
+# # Partial graph matching
+
+# %% [markdown]
 # ## Ws room dropout noise
 
 # %%
@@ -1961,7 +1964,9 @@ model = MatchingModel_GATv2SinkhornTopK(
     attention_dropout=attn_dropout,
     dropout_emb=dropout_emb,
     num_layers=num_layers,
-    heads=heads
+    heads=heads,
+    sinkhorn_max_iter=sinkhorn_max_iter,
+    sinkhorn_tau=sinkhorn_tau
 ).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
@@ -1999,10 +2004,10 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     resume=False
 )
 
-# %%
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="all")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="room")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="ws")
+# # %%
+# create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="all")
+# create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="room")
+# create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="ws")
 
 
 # %%
