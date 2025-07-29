@@ -48,7 +48,6 @@ import pickle
 import random
 import time
 import math
-import ast
 from pathlib import Path
 from typing import List, Tuple, Dict, Any
 from datetime import datetime
@@ -1304,7 +1303,8 @@ patience = 30
 
 ###     GRAPH MATCHING MODEL
 class MatchingModel_GATv2Sinkhorn(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, attention_dropout=0.1, dropout_emb=0.1, temperature: float = 1.0, max_iter: int = 10, tau: float = 1):
+    def __init__(self, in_dim, hidden_dim, out_dim, attention_dropout=0.1,
+                  dropout_emb=0.1, temperature: float = 1.0, max_iter: int = 10, tau: float = 1):
         super().__init__()
         self.gnn = nn.ModuleList([
             GATv2Conv(in_dim, hidden_dim, dropout=attention_dropout),
