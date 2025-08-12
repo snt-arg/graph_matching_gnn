@@ -13,6 +13,12 @@ import sys
 subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas",
                         "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
 
+# Check if pygmtools is installed
+try:
+    import pygmtools
+except ImportError:#pygmtools library
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"])
+
 # Check pytorch version and make sure you use a GPU Kernel
 import torch
 print("PyTorch version:", torch.__version__)
@@ -952,7 +958,7 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
         optimizer.zero_grad()
         batch_idx1 = batch1.batch
         batch_idx2 = batch2.batch
-        pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
+        pred_perm_list, batch_embeddings = model(batch1, batch2, perm_list, batch_idx1, batch_idx2)
 
         # accumulo loss per grafo
         batch_loss = 0.0
@@ -998,7 +1004,7 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
 
             batch_idx1 = batch1.batch
             batch_idx2 = batch2.batch
-            pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
+            pred_perm_list, batch_embeddings = model(batch1, batch2, perm_list, batch_idx1, batch_idx2)
 
             for P, P_gt in zip(pred_perm_list, perm_list):
                 # accuracy
@@ -1034,7 +1040,7 @@ def predict_matching_matrix(model, data1, data2, use_hungarian: bool = True):
         batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
         batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
 
-        sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2, inference=True)
+        sim_matrix_list, _ = model(data1, data2, batch_idx1=batch_idx1, batch_idx2=batch_idx2, inference=True)
         sim = sim_matrix_list[0].unsqueeze(0)  # [1, N1, N2]
 
         n1 = torch.tensor([sim.shape[1]], dtype=torch.int32, device=device)
@@ -1289,15 +1295,16 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
 in_dim = 7
 hidden_dim = 64
 out_dim = 32
-num_epochs = 200
+num_epochs = 500
 learning_rate = 1e-3
-batch_size = 1
+batch_size = 16
 weight_decay = 5e-5
-patience = 30
+patience = 100
 
 ###     GRAPH MATCHING MODEL
 class MatchingModel_GATv2Sinkhorn(nn.Module):
-    def __init__(self, in_dim, hidden_dim, out_dim, attention_dropout=0.1, dropout_emb=0.1, temperature: float = 1.0, max_iter: int = 10, tau: float = 1):
+    def __init__(self, in_dim, hidden_dim, out_dim, attention_dropout=0.1,
+                  dropout_emb=0.1, temperature: float = 1.0, max_iter: int = 10, tau: float = 1):
         super().__init__()
         self.gnn = nn.ModuleList([
             GATv2Conv(in_dim, hidden_dim, dropout=attention_dropout),
@@ -1322,11 +1329,12 @@ class MatchingModel_GATv2Sinkhorn(nn.Module):
                 x = self.dropout(x)
         return x
 
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False):
+    def forward(self, batch1, batch2, perm_list=None, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
 
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+        perm_list = [p.to(device) for p in perm_list] if perm_list is not None else None
 
         batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
         batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
@@ -1361,33 +1369,36 @@ class MatchingModel_GATv2Sinkhorn(nn.Module):
 
         return perm_pred_list, all_embeddings
 
-###     PARTIAL GRAPH MATCHING MODEL
+###     PARTIAL GRAPH MATCHING MODEL with MLP
 class MatchingModel_GATv2SinkhornTopK(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-        sinkhorn_max_iter: int = 15,
-        sinkhorn_tau: float = 0.1,
-        attention_dropout: float = 0.1,
-        dropout_emb: float = 0.1,
-        temperature: float = 1.0
-    ):
+    def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter: int = 10, sinkhorn_tau: float = 1.0,
+                 attention_dropout: float = 0.1, dropout_emb: float = 0.1, num_layers: int = 2, heads: int = 1):
         super().__init__()
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim, dropout=attention_dropout),
-            GATv2Conv(hidden_dim, out_dim, dropout=attention_dropout),
-        ])
+        # MLP for initial node feature transformation
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_emb),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_emb)
+        )
+        self.gnn = nn.ModuleList()
+        dims = [hidden_dim] * num_layers + [out_dim]
+        for i in range(num_layers):
+            # Always average the heads so the feature-dim stays dims[i+1]
+            self.gnn.append(
+                GATv2Conv(dims[i], dims[i+1],
+                            heads=heads, concat=False,
+                            dropout=attention_dropout)
+            )
         self.dropout = nn.Dropout(p=dropout_emb)
         # # bilinear weight matrix A per affinity
         # std = 1.0 / math.sqrt(out_dim)
         # self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
-        # # temperature per affinities
         # self.temperature = temperature
         # InstanceNorm per-sample
         self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-        # Sinkhorn hyperparams
         self.sinkhorn_max_iter = sinkhorn_max_iter
         self.sinkhorn_tau = sinkhorn_tau
 
@@ -1399,17 +1410,20 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
                 x = self.dropout(x)
         return x
 
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False):
+    def forward(self, batch1, batch2, perm_list=None, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
-
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+        perm_list = [p.to(device) for p in perm_list] if perm_list is not None else None
 
         batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
         batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-
-        h1 = self.encode(x1, edge1)
-        h2 = self.encode(x2, edge2)
+        
+        # Apply MLP before GNN
+        h1 = self.mlp(x1)
+        h2 = self.mlp(x2)
+        h1 = self.encode(h1, edge1)
+        h2 = self.encode(h2, edge2)
 
         B = batch_idx1.max().item() + 1
         perm_pred_list = []
@@ -1866,16 +1880,16 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
     return node_types
 
 # %% [markdown]
-# # Graph matching
+# # Partial graph matching
 
 # %% [markdown]
-# ## Global + Local noise
+# ## Ws room dropout noise
 
 # %%
 #load preprocessed dataset
 gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
-gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "global_local")
-models_path = os.path.join(GNN_PATH, 'models', 'graph_matching', 'global_local')
+gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
+models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise")
 
 original_graphs = deserialize_graph_matching_dataset(
     gm_equal_preprocessed_path,
@@ -1904,6 +1918,7 @@ d1,d2,gt = train_list[0]
 print(d1)
 print(d2)
 print(gt)
+print(gt.shape)
 plot_two_graphs_with_matching([d1,d2],gt_perm=gt,original_graphs=original_graphs,noise_graphs=noise_graphs,path=os.path.join(models_path, "train.png"))
 
 # %%
@@ -1921,17 +1936,48 @@ train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, co
 val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
+# Load best hyperparameters
+study_path = os.path.join(models_path, 'study.pkl')
+
+with open(study_path, 'rb') as f:
+    study = pickle.load(f)
+
+best_params = study.best_trial.params
+
+learning_rate = best_params['lr']
+weight_decay = best_params['weight_decay']
+hidden_dim = best_params['hidden_dim']
+out_dim = best_params['out_dim']
+batch_size = best_params['batch_size']
+dropout_emb = best_params['dropout_emb']
+attn_dropout = best_params['attn_dropout']
+num_layers = best_params['num_layers']
+heads = best_params['heads']
+sinkhorn_max_iter = 10
+sinkhorn_tau = 1
+
 # Modello e ottimizzatore
-model = MatchingModel_GATv2Sinkhorn(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
+model = MatchingModel_GATv2SinkhornTopK(
+    in_dim=in_dim,
+    hidden_dim=hidden_dim,
+    out_dim=out_dim,
+    attention_dropout=attn_dropout,
+    dropout_emb=dropout_emb,
+    num_layers=num_layers,
+    heads=heads,
+    sinkhorn_max_iter=sinkhorn_max_iter,
+    sinkhorn_tau=sinkhorn_tau
+).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
 
 # Logger TensorBoard
 writer = setup_tb_logger(
     base_dir="tb_logs",
     model_name=model._get_name(),
-    dataset_name="GM_global_local",
+    dataset_name="PGM_ws_room_dropout_noise",
     experiment_name="exp1"
 )
+
 #model summary
 print(model)
 print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
@@ -1958,10 +2004,10 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     resume=False
 )
 
-# %%
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), embedding_type, fps=0.001, node_type_filter="all")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), embedding_type, fps=0.001, node_type_filter="room")
-create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), embedding_type, fps=0.001, node_type_filter="ws")
+# # %%
+# create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="all")
+# create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_room.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="room")
+# create_embedding_gif_stride(val_embeddings_history, os.path.join(models_path, "embeddings_evolution_ws.gif"), embedding_type=embedding_type, fps=0.001, node_type_filter="ws")
 
 
 # %%
@@ -1983,9 +2029,9 @@ inference_times = []
 correct = 0
 total_cols = 0
 
-for i, (g1_out, g2_perm, gt_perm) in enumerate(val_list):
+for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     start_time = time.time()
-    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
+    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
     end_time = time.time()
     inference_times.append(end_time - start_time)
     errors = (result != gt_perm.to(result.device)).sum().item()
@@ -1995,6 +2041,9 @@ for i, (g1_out, g2_perm, gt_perm) in enumerate(val_list):
     # Accuracy calculation after hungarian
     pred_idx = result.argmax(dim=0)
     target_idx = gt_perm.argmax(dim=0)
+    # Ensure both tensors are on the same device before comparison
+    pred_idx = pred_idx.to(gt_perm.device)
+    target_idx = target_idx.to(gt_perm.device)
     correct += (pred_idx == target_idx).sum().item()
     total_cols += result.shape[1]
 
@@ -2006,8 +2055,8 @@ std_inference_time = np.std(inference_times)
 print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
 
 # %%
-g1_out, g2_perm, gt_perm = val_list[0]
-result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
+g1_out, g2_perm, gt_perm = test_list[3]
+result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
 
 plot_two_graphs_with_matching(
     [g1_out, g2_perm],
@@ -2020,3 +2069,5 @@ plot_two_graphs_with_matching(
     match_display="wrong",
     path=os.path.join(models_path, "test.png")
 )
+
+

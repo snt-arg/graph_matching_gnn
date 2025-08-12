@@ -122,11 +122,11 @@ g.manual_seed(seed)
 
 def objective_pgm(trial, train_dataset, val_dataset, path):
     lr           = trial.suggest_loguniform("lr", 1e-4, 1e-2)
-    weight_decay = 5e-5
-    dropout_emb  = trial.suggest_uniform("dropout", 0.0, 0.6)
-    hidden_dim   = 64
-    out_dim      = 32
-    batch_size   = 16
+    weight_decay = trial.suggest_loguniform("weight_decay", 1e-6, 1e-3)
+    hidden_dim   = trial.suggest_categorical("hidden_dim", [32, 64, 128])
+    out_dim      = trial.suggest_categorical("out_dim", [16, 32, 64])
+    batch_size   = trial.suggest_categorical("batch_size", [8, 16, 32])
+    dropout_emb  = trial.suggest_uniform("dropout_emb", 0.0, 0.6)
     attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
     sinkhorn_max_iter = 10
     sinkhorn_tau = 1.0
@@ -142,14 +142,24 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
         def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter, sinkhorn_tau,
                     attention_dropout, dropout_emb, num_layers, heads):
             super().__init__()
+            # MLP for initial node feature transformation
+            self.mlp = nn.Sequential(
+                nn.Linear(in_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_emb),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(p=dropout_emb)
+            )
             self.gnn = nn.ModuleList()
-            dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
+            dims = [hidden_dim] * num_layers + [out_dim]
             for i in range(num_layers):
-                # new: always average the heads so the feature‐dim stays dims[i+1]
+                # Always average the heads so the feature-dim stays dims[i+1]
                 self.gnn.append(
-                GATv2Conv(dims[i], dims[i+1],
-                            heads=heads, concat=False,
-                            dropout=attention_dropout))
+                    GATv2Conv(dims[i], dims[i+1],
+                              heads=heads, concat=False,
+                              dropout=attention_dropout)
+                )
             self.dropout = nn.Dropout(p=dropout_emb)
             # # bilinear weight matrix A per affinity
             # std = 1.0 / math.sqrt(out_dim)
@@ -176,9 +186,12 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
 
             batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
             batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-
-            h1 = self.encode(x1, edge1)
-            h2 = self.encode(x2, edge2)
+            
+            # Apply MLP before GNN
+            h1 = self.mlp(x1)
+            h2 = self.mlp(x2)
+            h1 = self.encode(h1, edge1)
+            h2 = self.encode(h2, edge2)
 
             B = batch_idx1.max().item() + 1
             loss = 0.0
@@ -336,21 +349,27 @@ train_dataset = GraphMatchingDataset(train_list)
 val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
-print("Starting hyperparameter optimization...")
+print("Continuing hyperparameter optimization...")
 
-#param opt 
-study = optuna.create_study(direction="minimize")
+study_path = os.path.join(models_path, "study.pkl")
+
+# Load the previous study
+if os.path.exists(study_path):
+    with open(study_path, "rb") as f:
+        study = pickle.load(f)
+    print(f"Loaded existing study with {len(study.trials)} trials.")
+else:
+    print("No existing study found, starting a new one.")
+    study = optuna.create_study(direction="minimize")
+
+# Continue optimizing (or start from scratch if no study existed)
 study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset, models_path), n_trials=30)
-print("Best hyperparameters: ", study.best_params)
-print("Best trial: ", study.best_trial)
-print("Best value: ", study.best_value)
-# Save the study
-with open(os.path.join(models_path, "study.pkl"), "wb") as f:
+
+# Save the updated study
+with open(study_path, "wb") as f:
     pickle.dump(study, f)
-# # Load the study
-# with open(os.path.join(models_path, "study.pkl"), "rb") as f:
-#     study = pickle.load(f)
-# Plot the study
+
+# Plot the study results
 fig = optuna.visualization.plot_optimization_history(study)
 fig.write_html(os.path.join(models_path, "opt_history.html"))
 fig.write_image(os.path.join(models_path, "opt_history.png"))
