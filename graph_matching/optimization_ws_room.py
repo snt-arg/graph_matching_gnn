@@ -320,8 +320,8 @@ print("Loading dataset...")
 
 #load preprocessed dataset
 gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
-gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_noise")
-models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "room_dropout_noise")
+gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
+models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise")
 
 original_graphs = deserialize_graph_matching_dataset(
     gm_equal_preprocessed_path,
