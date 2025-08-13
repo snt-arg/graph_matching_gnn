@@ -797,7 +797,7 @@ def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, pat
                 pt1 = g1.nodes[id1]['center']
                 pt2 = g2.nodes[id2]['center']
                 # skip if match_display filters out missing
-                if match_display in {"correct", "wrong"}:
+                if match_display in {"correct"}:
                     continue
                 color = 'yellow'
                 label = None
@@ -1216,33 +1216,36 @@ def split_graphs_stratified(
     test  = [pairs[i] for i in test_idx]
     return train, val, test
 
-###     PARTIAL GRAPH MATCHING MODEL
+###     PARTIAL GRAPH MATCHING MODEL with MLP
 class MatchingModel_GATv2SinkhornTopK(nn.Module):
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int,
-        out_dim: int,
-        sinkhorn_max_iter: int = 15,
-        sinkhorn_tau: float = 0.1,
-        attention_dropout: float = 0.1,
-        dropout_emb: float = 0.1,
-        temperature: float = 1.0
-    ):
+    def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter: int = 10, sinkhorn_tau: float = 1.0,
+                 attn_dropout: float = 0.1, dropout_emb: float = 0.1, num_layers: int = 2, heads: int = 1):
         super().__init__()
-        self.gnn = nn.ModuleList([
-            GATv2Conv(in_dim, hidden_dim, dropout=attention_dropout),
-            GATv2Conv(hidden_dim, out_dim, dropout=attention_dropout),
-        ])
+        # MLP for initial node feature transformation
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_emb),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_emb)
+        )
+        self.gnn = nn.ModuleList()
+        dims = [hidden_dim] * num_layers + [out_dim]
+        for i in range(num_layers):
+            # Always average the heads so the feature-dim stays dims[i+1]
+            self.gnn.append(
+                GATv2Conv(dims[i], dims[i+1],
+                            heads=heads, concat=False,
+                            dropout=attn_dropout)
+            )
         self.dropout = nn.Dropout(p=dropout_emb)
         # # bilinear weight matrix A per affinity
         # std = 1.0 / math.sqrt(out_dim)
         # self.A = nn.Parameter(torch.randn(out_dim, out_dim) * std)
-        # # temperature per affinities
         # self.temperature = temperature
         # InstanceNorm per-sample
         self.inst_norm = nn.InstanceNorm2d(1, affine=True)
-        # Sinkhorn hyperparams
         self.sinkhorn_max_iter = sinkhorn_max_iter
         self.sinkhorn_tau = sinkhorn_tau
 
@@ -1256,15 +1259,17 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 
     def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
-
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-
+        
         batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
         batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-
-        h1 = self.encode(x1, edge1)
-        h2 = self.encode(x2, edge2)
+        
+        # Apply MLP before GNN
+        h1 = self.mlp(x1)
+        h2 = self.mlp(x2)
+        h1 = self.encode(h1, edge1)
+        h2 = self.encode(h2, edge2)
 
         B = batch_idx1.max().item() + 1
         perm_pred_list = []
@@ -1332,27 +1337,56 @@ class PartialGraphMatching:
         model_class,
         data_paths,
         model_save_path,
-        in_dim,
-        hidden_dim,
-        out_dim,
-        batch_size,
-        learning_rate,
-        weight_decay,
-        num_epochs,
-        patience,
         device,
+        in_dim = None,
+        hidden_dim = None,
+        out_dim = None,
+        batch_size = None,
+        learning_rate = None,
+        weight_decay = None,
+        num_epochs = None,
+        patience = None,
+        dropout_emb = None,
+        attn_dropout = None,
+        num_layers = None,
+        heads = None,
+        sinkhorn_max_iter = None,
+        sinkhorn_tau = None,
         seed=42
     ):
         self.device = device
-        self.batch_size = batch_size
         self.model_save_path = model_save_path
         self.best_model_path = os.path.join(model_save_path, 'best_val_model.pt')
         self.final_model_path = os.path.join(model_save_path, 'final_model.pt')
         self.seed = seed
 
+        # Load best hyperparameters
+        study_path = os.path.join(self.model_save_path, 'study.pkl')
+
+        with open(study_path, 'rb') as f:
+            study = pickle.load(f)
+
+        best_params = study.best_trial.params
+        
+        self.learning_rate = best_params['lr'] if learning_rate is None else learning_rate
+        self.weight_decay = best_params['weight_decay'] if weight_decay is None else weight_decay
+        self.in_dim = best_params['in_dim'] if in_dim is None else in_dim
+        self.hidden_dim = best_params['hidden_dim'] if hidden_dim is None else hidden_dim
+        self.out_dim = best_params['out_dim'] if out_dim is None else out_dim
+        self.batch_size = best_params['batch_size'] if batch_size is None else batch_size
+        self.dropout_emb = best_params['dropout_emb'] if dropout_emb is None else dropout_emb
+        self.attn_dropout = best_params['attn_dropout'] if attn_dropout is None else attn_dropout
+        self.num_layers = best_params['num_layers'] if num_layers is None else num_layers
+        self.heads = best_params['heads'] if heads is None else heads
+        self.sinkhorn_max_iter = best_params['sinkhorn_max_iter'] if sinkhorn_max_iter is None else sinkhorn_max_iter
+        self.sinkhorn_tau = best_params['sinkhorn_tau'] if sinkhorn_tau is None else sinkhorn_tau
+
         # Model & optimizer
-        self.model = model_class(in_dim=in_dim, hidden_dim=hidden_dim, out_dim=out_dim).to(device)
-        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        self.model = model_class(in_dim=self.in_dim, hidden_dim=self.hidden_dim, out_dim=self.out_dim,
+                                  dropout_emb=self.dropout_emb, attn_dropout=self.attn_dropout,
+                                    num_layers=self.num_layers, heads=self.heads, sinkhorn_max_iter=self.sinkhorn_max_iter,
+                                      sinkhorn_tau=self.sinkhorn_tau).to(device)
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
         # Load data
         self._load_data_raw(data_paths)
@@ -1515,27 +1549,18 @@ class PartialGraphMatching:
 
 # %% [markdown]
 # # Unit test
-
 # %%
 paths = {
     "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
-    "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_noise")
+    "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
 }
 exp = PartialGraphMatching(
     model_class=MatchingModel_GATv2SinkhornTopK,
     data_paths=paths,
-    model_save_path=os.path.join(GNN_PATH, 'models', "partial_graph_matching", "room_dropout_noise"),
+    model_save_path=os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise"),
     in_dim=in_dim,
-    hidden_dim=hidden_dim,
-    out_dim=out_dim,
-    batch_size=batch_size,
-    learning_rate=learning_rate,
-    weight_decay=weight_decay,
-    num_epochs=num_epochs,
-    patience=patience,
     device=device
 )
-
 # %%
 exp.load_best_model()
 
@@ -1549,5 +1574,3 @@ exp.inference()
 # %%
 matching = exp.infer_matching(exp.original_graphs[1310], exp.noise_graphs[1310])
 print(matching)
-
-
