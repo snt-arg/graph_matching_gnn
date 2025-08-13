@@ -128,8 +128,8 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
     batch_size   = trial.suggest_categorical("batch_size", [8, 16, 32])
     dropout_emb  = trial.suggest_uniform("dropout_emb", 0.0, 0.6)
     attn_dropout = trial.suggest_uniform("attn_dropout", 0.0, 0.6)
-    sinkhorn_max_iter = 10
-    sinkhorn_tau = 1.0
+    sinkhorn_max_iter = trial.suggest_int("sinkhorn_max_iter", 10, 100)
+    sinkhorn_tau = trial.suggest_uniform("sinkhorn_tau", 0.01, 1.0)
     num_layers   = trial.suggest_int("num_layers",       1, 3)
     heads        = trial.suggest_int("heads",           1,   4)
 
@@ -363,7 +363,7 @@ else:
     study = optuna.create_study(direction="minimize")
 
 # Continue optimizing (or start from scratch if no study existed)
-study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset, models_path), n_trials=30)
+study.optimize(lambda trial: objective_pgm(trial, train_dataset, val_dataset, models_path), n_trials=10)
 
 # Save the updated study
 with open(study_path, "wb") as f:

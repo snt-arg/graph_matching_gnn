@@ -2001,7 +2001,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=patience,
-    resume=False
+    resume=True
 )
 
 # # %%
