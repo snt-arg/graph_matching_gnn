@@ -1,0 +1,189 @@
+=== SLURM JOB STARTED ===
+Date: Fri Aug  8 10:24:04 CEST 2025
+Running on node: iris-194
+Job ID: 4317102
+Job directory: /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/graph_matching
+Current directory: /home/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/graph_matching
+Loaded modules:
+
+Currently Loaded Modules:
+  1) env/release/default (S)
+
+  Where:
+   S:  Module is Sticky, requires --force to unload or purge
+
+ 
+
+The following modules were not unloaded:
+  (Use "module --force purge" to unload all):
+
+  1) env/release/default
+
+Lmod is automatically replacing "env/release/default" with "env/legacy/2020b".
+
+Activating virtualenv...
+Python path: /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/bin/python3
+Python 3.8.6
+Checking GPU availability...
+Fri Aug  8 10:24:05 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 565.57.01              Driver Version: 565.57.01      CUDA Version: 12.7     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  Tesla V100-SXM2-32GB           On  |   00000000:1A:00.0 Off |                    0 |
+| N/A   41C    P0             44W /  300W |       1MiB /  32768MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+CUDA available: True
+CUDA device: Tesla V100-SXM2-32GB
+Launching Python script...
+Requirement already satisfied: torch in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (2.2.2)
+Requirement already satisfied: torch-geometric in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (2.6.1)
+Requirement already satisfied: scikit-learn in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (1.3.2)
+Requirement already satisfied: pandas in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (2.0.3)
+Requirement already satisfied: shapely in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (2.0.7)
+Requirement already satisfied: seaborn in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (0.13.2)
+Requirement already satisfied: pygmtools in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (0.5.3)
+Requirement already satisfied: numpy in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (1.24.4)
+Requirement already satisfied: moviepy<2.0.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (1.0.3)
+Requirement already satisfied: matplotlib in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (3.7.5)
+Requirement already satisfied: tensorboard in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (2.14.0)
+Requirement already satisfied: optuna in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (4.3.0)
+Requirement already satisfied: plotly in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (6.0.1)
+Requirement already satisfied: kaleido in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (0.2.1)
+Requirement already satisfied: filelock in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (3.16.1)
+Requirement already satisfied: typing-extensions>=4.8.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (4.13.2)
+Requirement already satisfied: sympy in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (1.13.3)
+Requirement already satisfied: networkx in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (3.1)
+Requirement already satisfied: jinja2 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (3.1.6)
+Requirement already satisfied: fsspec in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (2025.3.0)
+Requirement already satisfied: nvidia-cuda-nvrtc-cu12==12.1.105 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (12.1.105)
+Requirement already satisfied: nvidia-cuda-runtime-cu12==12.1.105 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (12.1.105)
+Requirement already satisfied: nvidia-cuda-cupti-cu12==12.1.105 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (12.1.105)
+Requirement already satisfied: nvidia-cudnn-cu12==8.9.2.26 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (8.9.2.26)
+Requirement already satisfied: nvidia-cublas-cu12==12.1.3.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (12.1.3.1)
+Requirement already satisfied: nvidia-cufft-cu12==11.0.2.54 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (11.0.2.54)
+Requirement already satisfied: nvidia-curand-cu12==10.3.2.106 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (10.3.2.106)
+Requirement already satisfied: nvidia-cusolver-cu12==11.4.5.107 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (11.4.5.107)
+Requirement already satisfied: nvidia-cusparse-cu12==12.1.0.106 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (12.1.0.106)
+Requirement already satisfied: nvidia-nccl-cu12==2.19.3 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (2.19.3)
+Requirement already satisfied: nvidia-nvtx-cu12==12.1.105 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (12.1.105)
+Requirement already satisfied: triton==2.2.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch) (2.2.0)
+Requirement already satisfied: nvidia-nvjitlink-cu12 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from nvidia-cusolver-cu12==11.4.5.107->torch) (12.9.86)
+Requirement already satisfied: aiohttp in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch-geometric) (3.10.11)
+Requirement already satisfied: psutil>=5.8.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch-geometric) (7.0.0)
+Requirement already satisfied: pyparsing in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch-geometric) (3.1.4)
+Requirement already satisfied: requests in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch-geometric) (2.32.4)
+Requirement already satisfied: tqdm in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from torch-geometric) (4.67.1)
+Requirement already satisfied: scipy>=1.5.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from scikit-learn) (1.10.1)
+Requirement already satisfied: joblib>=1.1.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from scikit-learn) (1.4.2)
+Requirement already satisfied: threadpoolctl>=2.0.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from scikit-learn) (3.5.0)
+Requirement already satisfied: python-dateutil>=2.8.2 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from pandas) (2.9.0.post0)
+Requirement already satisfied: pytz>=2020.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from pandas) (2025.2)
+Requirement already satisfied: tzdata>=2022.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from pandas) (2025.2)
+Requirement already satisfied: Pillow>=7.2.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from pygmtools) (10.4.0)
+Requirement already satisfied: easydict>=1.7 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from pygmtools) (1.13)
+Requirement already satisfied: appdirs>=1.4.4 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from pygmtools) (1.4.4)
+Requirement already satisfied: async-timeout in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from pygmtools) (5.0.1)
+Requirement already satisfied: decorator<5.0,>=4.0.2 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from moviepy<2.0.0) (4.4.2)
+Requirement already satisfied: proglog<=1.0.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from moviepy<2.0.0) (0.1.11)
+Requirement already satisfied: imageio<3.0,>=2.5 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from moviepy<2.0.0) (2.35.1)
+Requirement already satisfied: imageio-ffmpeg>=0.2.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from moviepy<2.0.0) (0.5.1)
+Requirement already satisfied: contourpy>=1.0.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from matplotlib) (1.1.1)
+Requirement already satisfied: cycler>=0.10 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from matplotlib) (0.12.1)
+Requirement already satisfied: fonttools>=4.22.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from matplotlib) (4.57.0)
+Requirement already satisfied: kiwisolver>=1.0.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from matplotlib) (1.4.7)
+Requirement already satisfied: packaging>=20.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from matplotlib) (25.0)
+Requirement already satisfied: importlib-resources>=3.2.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from matplotlib) (6.4.5)
+Requirement already satisfied: absl-py>=0.4 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (2.2.2)
+Requirement already satisfied: grpcio>=1.48.2 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (1.70.0)
+Requirement already satisfied: google-auth<3,>=1.6.3 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (2.40.1)
+Requirement already satisfied: google-auth-oauthlib<1.1,>=0.5 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (1.0.0)
+Requirement already satisfied: markdown>=2.6.8 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (3.7)
+Requirement already satisfied: protobuf>=3.19.6 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (5.29.4)
+Requirement already satisfied: setuptools>=41.0.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (49.2.1)
+Requirement already satisfied: tensorboard-data-server<0.8.0,>=0.7.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (0.7.2)
+Requirement already satisfied: werkzeug>=1.0.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (3.0.6)
+Requirement already satisfied: wheel>=0.26 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from tensorboard) (0.45.1)
+Requirement already satisfied: alembic>=1.5.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from optuna) (1.14.1)
+Requirement already satisfied: colorlog in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from optuna) (6.9.0)
+Requirement already satisfied: sqlalchemy>=1.4.2 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from optuna) (2.0.40)
+Requirement already satisfied: PyYAML in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from optuna) (6.0.2)
+Requirement already satisfied: narwhals>=1.15.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from plotly) (1.39.0)
+Requirement already satisfied: Mako in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from alembic>=1.5.0->optuna) (1.3.10)
+Requirement already satisfied: importlib-metadata in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from alembic>=1.5.0->optuna) (8.5.0)
+Requirement already satisfied: cachetools<6.0,>=2.0.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from google-auth<3,>=1.6.3->tensorboard) (5.5.2)
+Requirement already satisfied: pyasn1-modules>=0.2.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from google-auth<3,>=1.6.3->tensorboard) (0.4.2)
+Requirement already satisfied: rsa<5,>=3.1.4 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from google-auth<3,>=1.6.3->tensorboard) (4.9.1)
+Requirement already satisfied: requests-oauthlib>=0.7.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from google-auth-oauthlib<1.1,>=0.5->tensorboard) (2.0.0)
+Requirement already satisfied: zipp>=3.1.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from importlib-resources>=3.2.0->matplotlib) (3.20.2)
+Requirement already satisfied: six>=1.5 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from python-dateutil>=2.8.2->pandas) (1.17.0)
+Requirement already satisfied: charset_normalizer<4,>=2 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from requests->torch-geometric) (3.4.1)
+Requirement already satisfied: idna<4,>=2.5 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from requests->torch-geometric) (3.10)
+Requirement already satisfied: urllib3<3,>=1.21.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from requests->torch-geometric) (1.26.20)
+Requirement already satisfied: certifi>=2017.4.17 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from requests->torch-geometric) (2025.4.26)
+Requirement already satisfied: greenlet>=1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from sqlalchemy>=1.4.2->optuna) (3.1.1)
+Requirement already satisfied: MarkupSafe>=2.1.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from werkzeug>=1.0.1->tensorboard) (2.1.5)
+Requirement already satisfied: aiohappyeyeballs>=2.3.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from aiohttp->torch-geometric) (2.4.4)
+Requirement already satisfied: aiosignal>=1.1.2 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from aiohttp->torch-geometric) (1.3.1)
+Requirement already satisfied: attrs>=17.3.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from aiohttp->torch-geometric) (25.3.0)
+Requirement already satisfied: frozenlist>=1.1.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from aiohttp->torch-geometric) (1.5.0)
+Requirement already satisfied: multidict<7.0,>=4.5 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from aiohttp->torch-geometric) (6.1.0)
+Requirement already satisfied: yarl<2.0,>=1.12.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from aiohttp->torch-geometric) (1.15.2)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from sympy->torch) (1.3.0)
+Requirement already satisfied: pyasn1<0.7.0,>=0.6.1 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from pyasn1-modules>=0.2.1->google-auth<3,>=1.6.3->tensorboard) (0.6.1)
+Requirement already satisfied: oauthlib>=3.0.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from requests-oauthlib>=0.7.0->google-auth-oauthlib<1.1,>=0.5->tensorboard) (3.2.2)
+Requirement already satisfied: propcache>=0.2.0 in /mnt/aiongpfs/users/jmillan/workspace/graph_matching_ws/graph_matching_gnn/.venv/lib/python3.8/site-packages (from yarl<2.0,>=1.12.0->aiohttp->torch-geometric) (0.2.0)
+PyTorch version: 2.2.2+cu121
+CUDA version: 12.1
+nvcc is not installed or not in PATH.
+Fri Aug  8 10:24:14 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 565.57.01              Driver Version: 565.57.01      CUDA Version: 12.7     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  Tesla V100-SXM2-32GB           On  |   00000000:1A:00.0 Off |                    0 |
+| N/A   41C    P0             44W /  300W |       1MiB /  32768MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
+|  No running processes found                                                             |
++-----------------------------------------------------------------------------------------+
+Loading dataset...
+Loaded 4895 pairs from ./GNN/preprocessed/graph_matching/equal/original.pkl
+Loaded 4895 pairs from ./GNN/preprocessed/partial_graph_matching/ws_room_dropout_noise/noise.pkl
+Loaded 3426 pairs from ./GNN/preprocessed/partial_graph_matching/ws_room_dropout_noise/train_dataset.pkl
+Loaded 734 pairs from ./GNN/preprocessed/partial_graph_matching/ws_room_dropout_noise/valid_dataset.pkl
+Loaded 735 pairs from ./GNN/preprocessed/partial_graph_matching/ws_room_dropout_noise/test_dataset.pkl
+Continuing hyperparameter optimization...
+Loaded existing study with 20 trials.
+[I 2025-08-08 10:33:20,748] Trial 20 pruned. 
+[I 2025-08-08 10:44:55,202] Trial 21 pruned. 
+[I 2025-08-08 10:56:20,747] Trial 22 pruned. 
+[I 2025-08-08 12:02:23,773] Trial 23 finished with value: 0.034491956476931984 and parameters: {'lr': 0.0023563245939132236, 'weight_decay': 2.0427604691765443e-06, 'hidden_dim': 64, 'out_dim': 32, 'batch_size': 32, 'dropout_emb': 0.07999240985980961, 'attn_dropout': 0.004165263592120997, 'sinkhorn_max_iter': 14, 'sinkhorn_tau': 0.4978290955896422, 'num_layers': 1, 'heads': 2}. Best is trial 12 with value: 0.020427221108389938.
+[I 2025-08-08 13:06:33,698] Trial 24 finished with value: 0.016147145839489025 and parameters: {'lr': 0.0008095510658996288, 'weight_decay': 1.2434375247247461e-05, 'hidden_dim': 128, 'out_dim': 64, 'batch_size': 32, 'dropout_emb': 0.05388126449940261, 'attn_dropout': 0.001853006600832388, 'sinkhorn_max_iter': 30, 'sinkhorn_tau': 0.23845677249694025, 'num_layers': 1, 'heads': 2}. Best is trial 24 with value: 0.016147145839489025.
+[I 2025-08-08 13:14:07,795] Trial 25 pruned. 
+[I 2025-08-08 13:20:12,007] Trial 26 pruned. 
+[I 2025-08-08 15:02:45,209] Trial 27 finished with value: 0.02022905218536439 and parameters: {'lr': 0.001149171217130336, 'weight_decay': 1.1236709322767275e-06, 'hidden_dim': 128, 'out_dim': 64, 'batch_size': 32, 'dropout_emb': 0.0026356679632695817, 'attn_dropout': 0.13595201633819098, 'sinkhorn_max_iter': 10, 'sinkhorn_tau': 0.19341050715357183, 'num_layers': 1, 'heads': 2}. Best is trial 24 with value: 0.016147145839489025.
+[I 2025-08-08 16:28:24,837] Trial 28 finished with value: 0.02143722983158153 and parameters: {'lr': 0.0011275769042679946, 'weight_decay': 1.1665280244960017e-06, 'hidden_dim': 128, 'out_dim': 64, 'batch_size': 32, 'dropout_emb': 0.009567791237255987, 'attn_dropout': 0.14397629237808532, 'sinkhorn_max_iter': 45, 'sinkhorn_tau': 0.20188367924845393, 'num_layers': 1, 'heads': 2}. Best is trial 24 with value: 0.016147145839489025.
+[I 2025-08-08 19:45:04,838] Trial 29 pruned. 
+=== SLURM JOB ENDED ===
