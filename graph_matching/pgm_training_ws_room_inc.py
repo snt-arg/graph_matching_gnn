@@ -1122,6 +1122,7 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
 
                 # Rebuild optimizer with lower LR for GNN
                 optimizer = torch.optim.Adam([
+                    {"params": model.mlp.parameters(), "lr": 5e-5},
                     {"params": model.gnn.parameters(), "lr": 5e-5},  # lower learning rate
                     {"params": model.inst_norm.parameters(), "lr": 1e-4},
                 ], weight_decay=1e-4)
@@ -2010,6 +2011,9 @@ for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     # Accuracy calculation after hungarian
     pred_idx = result.argmax(dim=0)
     target_idx = gt_perm.argmax(dim=0)
+    # Ensure both tensors are on the same device before comparison
+    pred_idx = pred_idx.to(gt_perm.device)
+    target_idx = target_idx.to(gt_perm.device)
     correct += (pred_idx == target_idx).sum().item()
     total_cols += result.shape[1]
 
@@ -2035,11 +2039,11 @@ plot_two_graphs_with_matching(
 )
 # Freeze MLP
 for param in model.mlp.parameters():
-    param.requires_grad = False
+    param.requires_grad = True
 
 # Freeze GATv2
 for param in model.gnn.parameters():
-    param.requires_grad = False
+    param.requires_grad = True
 
 # Instance Norm Trainable
 for param in model.inst_norm.parameters():
@@ -2071,16 +2075,69 @@ writer = setup_tb_logger(
 #model summary
 print(model)
 print(f"Number of trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
+
 train_losses, val_losses, val_embeddings_history = train_loop(
     model=model,
     optimizer=optimizer,
     train_loader=train_loader,
     val_loader=val_loader,
-    num_epochs=500,
+    num_epochs=2000,
     writer=writer,
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=150,
-    resume=False,
+    resume=True,
     unfreeze_epoch=5
 )
+
+plot_losses(train_losses, val_losses, os.path.join(models_path, 'losses.png'))
+
+# Evaluate on the test set
+test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
+print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
+
+inference_times = []
+# use the model to predict the matching on a test graph
+correct = 0
+total_cols = 0
+
+for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
+    start_time = time.time()
+    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
+    end_time = time.time()
+    inference_times.append(end_time - start_time)
+    errors = (result != gt_perm.to(result.device)).sum().item()
+    if errors > 0:
+        
+        print(f"Graph {i}: Errors found: {errors}")
+
+    # Accuracy calculation after hungarian
+    pred_idx = result.argmax(dim=0)
+    target_idx = gt_perm.argmax(dim=0)
+    # Ensure both tensors are on the same device before comparison
+    pred_idx = pred_idx.to(gt_perm.device)
+    target_idx = target_idx.to(gt_perm.device)
+    correct += (pred_idx == target_idx).sum().item()
+    total_cols += result.shape[1]
+
+accuracy = correct / total_cols if total_cols > 0 else 0.0
+print(f"Test Accuracy (after Hungarian): {accuracy:.4f}")
+
+mean_inference_time = np.mean(inference_times)
+std_inference_time = np.std(inference_times)
+print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
+g1_out, g2_perm, gt_perm = test_list[0]
+result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
+
+plot_two_graphs_with_matching(
+    [g1_out, g2_perm],
+    gt_perm=gt_perm,
+    pred_perm=result,
+    original_graphs=original_graphs,
+    noise_graphs=noise_graphs,
+    viz_rooms=True,
+    viz_ws=True,
+    match_display="wrong",
+    path=os.path.join(models_path, "test.png")
+)
+
