@@ -2,7 +2,8 @@
 #SBATCH -c 1
 #SBATCH --time=0-48:00:00
 #SBATCH -p gpu
-#SBATCH --gres=gpu:1 
+#SBATCH --gres=gpu:volta:1
+#SBATCH --constraint=volta32
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=matteogiorgi196@gmail.com
 
@@ -57,7 +58,8 @@ echo "Launching Python script..."
 # python3 -u optimization_room.py 
 # python3 -u optimization_ws_room.py 
 # python3 -u embedding_debug.py 
-python3 -u pgm_training_ws_room.py
+# python3 -u pgm_training_ws_room.py
+python3 -u pgm_training_ws_room_inc.py
 
 
 echo "=== SLURM JOB ENDED ==="
