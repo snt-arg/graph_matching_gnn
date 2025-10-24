@@ -6,7 +6,7 @@
 
 # %%
 #graph_matching.py
-GNN_PATH = './GNN/'
+GNN_PATH = '/home/vboxuser/Downloads/GNN/GNN'
 import os
 if not os.path.exists(GNN_PATH):
     os.makedirs(GNN_PATH)
@@ -1543,7 +1543,6 @@ class PartialGraphMatching:
             viz_ws=True,
             match_display="all"
         )
-
         return matching_matrix
 
 
@@ -1574,3 +1573,4 @@ exp.inference()
 # %%
 matching = exp.infer_matching(exp.original_graphs[1310], exp.noise_graphs[1310])
 print(matching)
+plt.show(block=True)
