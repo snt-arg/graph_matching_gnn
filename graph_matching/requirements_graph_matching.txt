@@ -21,7 +21,7 @@ decorator==4.4.2
 easydict==1.13
 executing==2.2.0
 filelock==3.16.1
-fonttools==4.57.0
+fonttools==4.61.0
 frozenlist==1.5.0
 fsspec==2025.3.0
 google-auth==2.40.1
