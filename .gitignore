@@ -8,4 +8,5 @@ slurm*
 graph_matching/preamble.py
 graph_matching/GNN.tar.bz2
 graph_matching/tb_logs
-Colab Notebooks/
+Colab Notebooks/tb_logs/
+core

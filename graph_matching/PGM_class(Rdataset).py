@@ -1,19 +1,15 @@
 # %% [markdown]
 # # Partial Graph Matching
 
-
 # %% [markdown]
 # # Import + util + class
 
-
 # %%
 #graph_matching.py
-# GNN_PATH = './GNN/'  # COMMENTED: Use absolute path from wrapper instead
-# import os
-# if not os.path.exists(GNN_PATH):
-#     os.makedirs(GNN_PATH)
+GNN_PATH = './GNN/'
 import os
-
+if not os.path.exists(GNN_PATH):
+    os.makedirs(GNN_PATH)
 
 # Check pytorch version and make sure you use a GPU Kernel
 # %%
@@ -28,9 +24,7 @@ from pathlib import Path
 from typing import List, Tuple, Dict, Any
 from datetime import datetime
 
-
 import matplotlib
-
 
 matplotlib.use("Qt5Agg")
 # ─── Third-party libraries ─────────────────────────────────────────────────────
@@ -45,7 +39,6 @@ from sklearn.manifold import TSNE
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -53,19 +46,15 @@ from torch.utils.data import Dataset, DataLoader
 from torch.utils.tensorboard import SummaryWriter
 
 
-
 from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GATv2Conv, GCNConv
-
 
 from moviepy.editor import ImageSequenceClip
 import optuna
 import json
 
-
 #set device as cuda if available to load model and data on gpu
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 # ─── Local application/library imports ────────────────────────────────────────
 import pygmtools
@@ -74,7 +63,6 @@ pygmtools.BACKEND = 'pytorch'
 # Set Seed for reproducibility
 seed = 42
 
-
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -82,37 +70,29 @@ def set_seed(seed=42):
     torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
 
-
     os.environ['PYTHONHASHSEED'] = str(seed)
-
 
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 # Set the seed once at the beginning
 set_seed(seed)
-
 
 # For reproducible DataLoader shuffle
 g = torch.Generator()
 g.manual_seed(seed)
 
-
 # %% [markdown]
 # ## Sinkhorn_topk
-
 
 # %%
 import torch
 import torch.nn as nn
 from torch import Tensor
 
-
 def soft_topk(scores, ks, max_iter=10, tau=1., nrows=None, ncols=None, return_prob=False):
     r"""
     Topk-GM algorithm to suppress matches containing outliers.
-
 
     :param scores: :math:`(b\times n_1 \times n_2)` input 3d tensor. :math:`b`: batch size
     :param ks: :math:`(b)` number of matches of each graph pair
@@ -122,7 +102,6 @@ def soft_topk(scores, ks, max_iter=10, tau=1., nrows=None, ncols=None, return_pr
     :param ncols: :math:`(b)` number of objects in dim2
     :param return_prob: whether to return the soft permutation matrix (default: ``False``)
     :return: :math:`(b\times n_1 \times n_2)` the hard permutation matrix
-
 
               if ``return_prob=True``, also return :math:`(b\times n_1 \times n_2)` the computed soft permutation matrix
     """
@@ -135,30 +114,23 @@ def soft_topk(scores, ks, max_iter=10, tau=1., nrows=None, ncols=None, return_pr
             scores[idx, 0: n1, 0: n2].reshape(-1).unsqueeze(-1) - anchors.unsqueeze(0))  # .view(n1, n2, 2)
         dist_mat_list.append(single_dist_mat)
 
-
     row_prob = torch.ones(scores.shape[0], scores.shape[1] * scores.shape[2], device=scores.device)
     col_prob = torch.zeros((scores.shape[0], 2), dtype=torch.float, device=scores.device)
     col_prob[:, 1] += ks
     col_prob[:, 0] += nrows * ncols - ks
 
-
     sk = Sinkhorn_m(max_iter=max_iter, tau=tau, batched_operation=False)
-
 
     output = sk(dist_mat_list, row_prob, col_prob, nrows, ncols)
 
-
     top_indices = torch.argsort(output[:, :, 1], descending=True, dim=-1)
-
 
     output_s = torch.full(scores.shape, 0, device=scores.device, dtype=scores.dtype)
     for batch in range(output_s.shape[0]):
         output_s[batch, 0: nrows[batch], 0: ncols[batch]] = output[batch, 0: nrows[batch] * ncols[batch], 1].view(nrows[batch], -1)
 
-
     x = torch.zeros(scores.shape, device=scores.device)
     x = greedy_perm(x, top_indices, ks)
-
 
     if return_prob:
         return x, output_s
@@ -166,11 +138,9 @@ def soft_topk(scores, ks, max_iter=10, tau=1., nrows=None, ncols=None, return_pr
         return x
 
 
-
 def greedy_perm(x, top_indices, ks):
     r"""
     Greedy-topk algorithm to select matches with topk confidences.
-
 
     :param x: :math:`(b\times n_1 \times n_2)` input 3d tensor. :math:`b`: batch size
     :param top_indices: indices of topk matches
@@ -192,30 +162,23 @@ def greedy_perm(x, top_indices, ks):
     return x
 
 
-
 class Sinkhorn_m(nn.Module):
     r"""
     Sinkhorn algorithm with marginal distributions turns the input matrix to satisfy the marginal distributions.
 
-
     Sinkhorn algorithm firstly applies an ``exp`` function with temperature :math:`\tau`:
-
 
     .. math::
         \mathbf{\Gamma}_{i,j} = \exp \left(\frac{\mathbf{\gamma}_{i,j}}{\tau}\right)
 
-
     And then turns the matrix into doubly-stochastic matrix by iterative row- and column-wise normalization:
-
 
     .. math::
         \mathbf{\Gamma} &= \text{diag}\left((\mathbf{\Gamma} \mathbf{1} \oslash \mathbf{r})\right)^{-1} \mathbf{\Gamma}\\
         \mathbf{\Gamma} &= \text{diag}\left((\mathbf{\Gamma}^{\top} \mathbf{1} \oslash \mathbf{c})\right)^{-1} \mathbf{\Gamma}
 
-
     where :math:`\oslash` means element-wise division, :math:`\mathbf{1}` means a column-vector
     whose elements are all :math:`1`\ s, :math:`\mathbf{r}` and :math:`\mathbf{c}` refers to row and column distribution, respectively.
-
 
     :param max_iter: maximum iterations (default: ``10``)
     :param tau: the hyper parameter :math:`\tau` controlling the temperature (default: ``1``)
@@ -224,29 +187,24 @@ class Sinkhorn_m(nn.Module):
     :param batched_operation: apply batched_operation for better efficiency (but may cause issues for back-propagation,
      default: ``False``)
 
-
     .. note::
         ``tau`` is an important hyper parameter to be set for Sinkhorn algorithm. ``tau`` controls the distance between
         the predicted doubly-stochastic matrix, and the discrete permutation matrix computed by Hungarian algorithm (see
         :func:`~src.lap_solvers.hungarian.hungarian`). Given a small ``tau``, Sinkhorn performs more closely to
         Hungarian, at the cost of slower convergence speed and reduced numerical stability.
 
-
     .. note::
         We recommend setting ``log_forward=True`` because it is more numerically stable. It provides more precise
         gradient in back propagation and helps the model to converge better and faster.
-
 
     .. warning::
         If you set ``log_forward=False``, this function behaves a little bit differently: it does not include the
         ``exp`` part.
 
-
     .. note::
         Setting ``batched_operation=True`` may be preferred when you are doing inference with this module and do not
         need the gradient.
     """
-
 
     def __init__(self, max_iter: int = 10, tau: float = 1., epsilon: float = 1e-4,
                  log_forward: bool = True, batched_operation: bool = False):
@@ -260,7 +218,6 @@ class Sinkhorn_m(nn.Module):
         self.batched_operation = batched_operation  # batched operation may cause instability in backward computation,
         # but will boost computation.
 
-
     def forward(self, s: Tensor, row_prob: Tensor, col_prob: Tensor, nrows: Tensor = None, ncols: Tensor = None,
                 dummy_row: bool = False) -> Tensor:
         r"""
@@ -273,18 +230,15 @@ class Sinkhorn_m(nn.Module):
          default: ``False``
         :return: :math:`(b\times n_1 \times n_2)` the computed doubly-stochastic matrix
 
-
         .. note::
             We support batched instances with different number of nodes, therefore ``nrows`` and ``ncols`` are
             required to specify the exact number of objects of each dimension in the batch. If not specified, we assume
             the batched matrices are not padded.
 
-
         .. note::
             The original Sinkhorn algorithm only works for square matrices. To handle cases where the graphs to be
             matched have different number of nodes, it is a common practice to add dummy rows to construct a square
             matrix. After the row and column normalizations, the padded rows are discarded.
-
 
         .. note::
             We assume row number <= column number. If not, the input matrix will be transposed.
@@ -293,7 +247,6 @@ class Sinkhorn_m(nn.Module):
             return self.forward_log(s, row_prob, col_prob, nrows, ncols, dummy_row)
         else:
             raise NotImplementedError
-
 
     def forward_log(self, s, row_prob, col_prob, nrows=None, ncols=None, dummy_row=True):
         """Compute sinkhorn with row/column normalization in the log space."""
@@ -306,22 +259,17 @@ class Sinkhorn_m(nn.Module):
         #     raise ValueError('input data shape not understood.')
         matrix_input = False
 
-
         batch_size = len(s)  # s.shape[0]
-
 
         # operations are performed on log_s
         s = [s[i] / self.tau for i in range(len(s))]
 
-
         log_row_prob = torch.log(row_prob).unsqueeze(2)
         log_col_prob = torch.log(col_prob).unsqueeze(1)
-
 
         if self.batched_operation:
             log_s = s
             last_log_s = log_s
-
 
             for i in range(self.max_iter):
                 if i % 2 == 0:
@@ -338,29 +286,23 @@ class Sinkhorn_m(nn.Module):
                     log_s = log_s - log_sum + log_col_prob
                     log_s[torch.isnan(log_s)] = -float('inf')
 
-
                 # ret_log_s[b, row_slice, col_slice] = log_s
-
 
             # if i == self.max_iter - 1:
             # print('warning: Sinkhorn is not converged.')
 
-
             if matrix_input:
                 log_s.squeeze_(0)
-
 
             return torch.exp(log_s)
         else:
             # ret_log_s = torch.full((batch_size, s.shape[1], s.shape[2]), -float('inf'), device=s.device, dtype=s.dtype)
             ret_log_s = torch.full((batch_size, nrows.max() * ncols.max(), 2), -float('inf'), device=s[0].device, dtype=s[0].dtype)
 
-
             for b in range(batch_size):
                 # row_slice = slice(0, nrows[b])
                 # col_slice = slice(0, ncols[b])
                 log_s = s[b]
-
 
                 for i in range(self.max_iter):
                     if i % 2 == 0:
@@ -383,7 +325,6 @@ class Sinkhorn_m(nn.Module):
                         log_s[torch.isnan(log_s)] = -float('inf')
                     step += 1
 
-
                 ret_log_s[b, 0: nrows[b] * ncols[b]] = log_s
             # if dummy_row:
             #     if dummy_shape[1] > 0:
@@ -396,23 +337,18 @@ class Sinkhorn_m(nn.Module):
             if matrix_input:
                 ret_log_s.squeeze_(0)
 
-
             return torch.exp(ret_log_s)
 
-
         # ret_log_s = torch.full((batch_size, s.shape[1], s.shape[2]), -float('inf'), device=s.device, dtype=s.dtype)
-
 
         # for b in range(batch_size):
         #    row_slice = slice(0, nrows[b])
         #    col_slice = slice(0, ncols[b])
         #    log_s = s[b, row_slice, col_slice]
 
-
     def forward_ori(self, s, nrows=None, ncols=None, dummy_row=False):
         r"""
         Computing sinkhorn with row/column normalization.
-
 
         .. warning::
             This function is deprecated because :meth:`~src.lap_solvers.sinkhorn.Sinkhorn.forward_log` is more
@@ -426,18 +362,14 @@ class Sinkhorn_m(nn.Module):
         else:
             raise ValueError('input data shape not understood.')
 
-
         batch_size = s.shape[0]
 
-
         # s = s.to(dtype=dtype)
-
 
         if nrows is None:
             nrows = [s.shape[1] for _ in range(batch_size)]
         if ncols is None:
             ncols = [s.shape[2] for _ in range(batch_size)]
-
 
         # tau scaling
         ret_s = torch.zeros_like(s)
@@ -445,7 +377,6 @@ class Sinkhorn_m(nn.Module):
             ret_s[b, 0:n, 0:ncols[b]] = \
                 nn.functional.softmax(s[b, 0:n, 0:ncols[b]] / self.tau, dim=-1)
         s = ret_s
-
 
         # add dummy elements
         if dummy_row:
@@ -459,7 +390,6 @@ class Sinkhorn_m(nn.Module):
             for b in range(batch_size):
                 s[b, ori_nrows[b]:nrows[b], :ncols[b]] = self.epsilon
 
-
         row_norm_ones = torch.zeros(batch_size, s.shape[1], s.shape[1], device=s.device,
                                     dtype=s.dtype)  # size: row x row
         col_norm_ones = torch.zeros(batch_size, s.shape[2], s.shape[2], device=s.device,
@@ -470,9 +400,7 @@ class Sinkhorn_m(nn.Module):
             row_norm_ones[b, row_slice, row_slice] = 1
             col_norm_ones[b, col_slice, col_slice] = 1
 
-
         s += self.epsilon
-
 
         for i in range(self.max_iter):
             if i % 2 == 0:
@@ -484,7 +412,6 @@ class Sinkhorn_m(nn.Module):
                 # ones = torch.ones(batch_size, s.shape[2], s.shape[2], device=s.device)
                 sum = torch.sum(torch.mul(row_norm_ones.unsqueeze(3), s.unsqueeze(1)), dim=2)
 
-
             tmp = torch.zeros_like(s)
             for b in range(batch_size):
                 row_slice = slice(0, nrows[b] if nrows is not None else s.shape[2])
@@ -492,29 +419,23 @@ class Sinkhorn_m(nn.Module):
                 tmp[b, row_slice, col_slice] = 1 / sum[b, row_slice, col_slice]
             s = s * tmp
 
-
         if dummy_row:
             if dummy_shape[1] > 0:
                 s = s[:, :-dummy_shape[1]]
             for b in range(batch_size):
                 s[b, ori_nrows[b]:nrows[b], :ncols[b]] = 0
 
-
         if matrix_input:
             s.squeeze_(0)
 
-
         return s
-
 
 # %% [markdown]
 # ## Utilities
 
-
 # %%
 def deserialize_MSD_dataset(data_path, original_path=None, noise_path=None, dimensions_path=None):
     dataset_dir = Path(data_path)
-
 
     dimensions = []
     if dimensions_path is not None:
@@ -525,11 +446,9 @@ def deserialize_MSD_dataset(data_path, original_path=None, noise_path=None, dime
         with open(dimensions_file, 'rb') as f:
             dimensions = pickle.load(f)
 
-
     # Clear existing graphs
     original = []
     noise = []
-
 
     if original_path is not None:
         original_dir = dataset_dir / original_path
@@ -541,13 +460,11 @@ def deserialize_MSD_dataset(data_path, original_path=None, noise_path=None, dime
                 graph.graph['name'] = file.stem
             original.append(graph)
 
-
     if noise_path is not None:
         def extract_numeric_key(file):
             """Extracts (X, Y) from filenames like 'X_Y.pt' for proper numeric sorting."""
             name_parts = file.stem.split("_")
             return int(name_parts[0]), int(name_parts[1])
-
 
         noise_dir = dataset_dir / noise_path
         noise_files = sorted(noise_dir.glob("*.pt"), key=extract_numeric_key)
@@ -558,9 +475,7 @@ def deserialize_MSD_dataset(data_path, original_path=None, noise_path=None, dime
                 graph.graph['name'] = file.stem
             noise.append(graph)
 
-
     return original, noise, dimensions
-
 
 def deserialize_graph_matching_dataset(path: str, filename: str = "train_dataset.pkl") -> List[Tuple[Data, Data, torch.Tensor]]:
     """
@@ -568,18 +483,14 @@ def deserialize_graph_matching_dataset(path: str, filename: str = "train_dataset
     """
     full_path = os.path.join(path, filename)
 
-
     if not os.path.exists(full_path):
         raise FileNotFoundError(f"File not found: {full_path}")
-
 
     with open(full_path, 'rb') as f:
         pairs = pickle.load(f)
 
-
     print(f"Loaded {len(pairs)} pairs from {full_path}")
     return pairs
-
 
 # Create the plot
 def plot_losses(train_losses, val_losses, output_path=None):
@@ -588,14 +499,12 @@ def plot_losses(train_losses, val_losses, output_path=None):
     sns.lineplot(x=epochs, y=train_losses, label="Training Loss")
     sns.lineplot(x=epochs, y=val_losses, label="Validation Loss")
 
-
     # Add labels and title
     plt.xlabel("Epoch")
     plt.ylabel("Loss")
     plt.title("Training vs Validation Loss")
     plt.legend()
     plt.tight_layout()
-
 
     if output_path is None:
         plt.show()
@@ -604,19 +513,15 @@ def plot_losses(train_losses, val_losses, output_path=None):
         plt.savefig(output_path)
         plt.close()
 
-
 class GraphMatchingDataset(Dataset):
     def __init__(self, pairs):  # lista di (Data, Data, P)
         self.pairs = pairs
 
-
     def __len__(self):
         return len(self.pairs)
 
-
     def __getitem__(self, idx):
         return self.pairs[idx]  # data1, data2, P
-
 
 def collate_pyg_matching(batch):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -632,12 +537,10 @@ def collate_pyg_matching(batch):
     
     return batch1, batch2, perm_list
 
-
 ### FUNCTIONS WITH BCE
 def bce_permutation_loss(P, P_gt, eps: float = 1e-9):
     """Element-wise Binary Cross Entropy loss between prediction and ground truth."""
     return - (P_gt * torch.log(P + eps) + (1 - P_gt) * torch.log(1 - P + eps)).mean()
-
 
 def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1e-9):
     """
@@ -652,18 +555,15 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
     all_embeddings = []
     device = next(model.parameters()).device
 
-
     for batch1, batch2, perm_list in loader:
         batch1 = batch1.to(device)
         batch2 = batch2.to(device)
         perm_list = [p.to(device) for p in perm_list]
 
-
         optimizer.zero_grad()
         batch_idx1 = batch1.batch
         batch_idx2 = batch2.batch
         pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
-
 
         # accumulo loss per grafo
         batch_loss = 0.0
@@ -673,18 +573,14 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
             total_loss += loss.item()
             num_graphs += 1
 
-
         batch_loss = batch_loss / len(pred_perm_list)  # per logging/grad
         batch_loss.backward()
         optimizer.step()
 
-
         all_embeddings.extend(batch_embeddings)
-
 
     avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
     return avg_loss, all_embeddings
-
 
 
 def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
@@ -703,7 +599,6 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
     num_graphs = 0
     all_embeddings = []
 
-
     device = next(model.parameters()).device
     with torch.no_grad():
         for batch1, batch2, perm_list in loader:
@@ -711,11 +606,9 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
             batch2 = batch2.to(device)
             perm_list = [p.to(device) for p in perm_list]
 
-
             batch_idx1 = batch1.batch
             batch_idx2 = batch2.batch
             pred_perm_list, batch_embeddings = model(batch1, batch2, batch_idx1, batch_idx2)
-
 
             for P, P_gt in zip(pred_perm_list, perm_list):
                 # accuracy
@@ -724,20 +617,16 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
                 correct += (pred_idx == target_idx).sum().item()
                 total_cols += P.shape[1]
 
-
                 # loss per grafo
                 loss = bce_permutation_loss(P, P_gt, eps)
                 total_loss += loss.item()
                 num_graphs += 1
 
-
             all_embeddings.extend(batch_embeddings)
-
 
     avg_acc = correct / total_cols if total_cols > 0 else 0.0
     avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
     return avg_acc, avg_loss, all_embeddings
-
 
 def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
                best_model_path='checkpoint.pt', final_model_path='final_model.pt',
@@ -747,11 +636,9 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
     patience_counter = 0
     start_epoch = 0
 
-
     train_losses = []
     val_losses = []
     val_embeddings_history = []
-
 
     # Resume from checkpoint if requested
     if resume and os.path.exists(best_model_path):
@@ -764,9 +651,7 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
         best_epoch = checkpoint['best_epoch']
         print(f"Resumed from epoch {start_epoch}")
 
-
     print("Starting training...")
-
 
     try:
         for epoch in range(start_epoch, num_epochs):
@@ -778,7 +663,6 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
             train_losses.append(train_loss)
             val_losses.append(val_loss)
             val_embeddings_history.append(val_embeddings)
-
 
             # Save best model
             if val_loss < best_val_loss:
@@ -796,18 +680,14 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
             else:
                 patience_counter += 1
 
-
             print(f"Epoch {epoch:03} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
-
 
             if patience_counter >= patience:
                 print(f"Early stopping triggered at epoch {epoch}. Best was {best_epoch}.")
                 break
 
-
     except KeyboardInterrupt:
         print("Training interrupted manually (Ctrl+C).")
-
 
     # Save final model
     torch.save({
@@ -819,9 +699,7 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
     }, final_model_path)
     print("Final model saved.")
 
-
     return train_losses, val_losses, val_embeddings_history
-
 
 
 def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, path=None, noise_graphs=None, pred_perm=None,
@@ -834,7 +712,6 @@ def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, pat
     if noise_graphs is None:
         noise_graphs = original_graphs
 
-
     # Extract tensors and original node order
     g1tensor, g2tensor = copy.deepcopy(graphs_list[0]), copy.deepcopy(graphs_list[1])
     # Node names for g1 in original order
@@ -844,12 +721,10 @@ def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, pat
     perm = g2tensor.permutation.tolist()
     node_names2 = [orig_names2[p] for p in perm]
 
-
     # Convert to NetworkX
     g1 = copy.deepcopy(pyg_data_to_nx_digraph(g1tensor, original_graphs))
     g2_original = copy.deepcopy(pyg_data_to_nx_digraph(g2tensor, noise_graphs))
     g2 = g2_original.copy()
-
 
     # Translate g2 for side-by-side plot
     max_x_g1 = max(data['center'][0] for _, data in g1.nodes(data=True))
@@ -866,16 +741,13 @@ def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, pat
         if 'limits' in data:
             data['limits'] = [[x + translation_x, y] for x, y in data['limits']]
 
-
     fig, ax = plt.subplots(figsize=(16, 10))
     legend_added = set()
-
 
     def plot_graph(g, is_g1):
         color_room = 'lightblue' if is_g1 else 'navajowhite'
         color_ws = 'red' if is_g1 else 'purple'
         prefix = "(G1)" if is_g1 else "(G2)"
-
 
         if viz_rooms:
             for n, d in g.nodes(data=True):
@@ -887,7 +759,6 @@ def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, pat
                     ax.scatter(d['center'][0], d['center'][1], color='blue', s=80,
                                label=f"Centroid {prefix}" if f"room-pt-{prefix}" not in legend_added else "")
                     legend_added.update({f"room-poly-{prefix}", f"room-pt-{prefix}"})
-
 
         if viz_ws:
             for n, d in g.nodes(data=True):
@@ -902,10 +773,8 @@ def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, pat
                                 label=f"WS limits {prefix}" if f"limits-{prefix}" not in legend_added else "")
                         legend_added.add(f"limits-{prefix}")
 
-
     plot_graph(g1, is_g1=True)
     plot_graph(g2, is_g1=False)
-
 
     # Plot matching lines with partial-match and ID presence checks
     if pred_perm is not None:
@@ -971,7 +840,6 @@ def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, pat
             ax.plot([pt1[0], pt2[0]], [pt1[1], pt2[1]],
                     color=color, linestyle='-', alpha=0.6, linewidth=1, label=label)
 
-
     ax.set_title("Graph Matching: Green = Correct, Red = Wrong")
     ax.axis("equal")
     ax.legend()
@@ -981,7 +849,6 @@ def plot_two_graphs_with_matching_old(graphs_list, gt_perm, original_graphs, pat
     else:
         plt.savefig(path)
         plt.close()
-
 
 def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=None, path=None, noise_graphs=None, pred_perm=None,
                                   viz_rooms=True, viz_ws=True,
@@ -993,18 +860,15 @@ def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=Non
     if noise_graphs is None:
         noise_graphs = original_graphs
 
-
     g1tensor, g2tensor = copy.deepcopy(graphs_list[0]), copy.deepcopy(graphs_list[1])
     node_names1 = list(g1tensor.node_names)
     orig_names2 = list(g2tensor.node_names)
     perm = g2tensor.permutation.tolist()
     node_names2 = [orig_names2[p] for p in perm]
 
-
     g1 = copy.deepcopy(pyg_data_to_nx_digraph(g1tensor, original_graphs))
     g2_original = copy.deepcopy(pyg_data_to_nx_digraph(g2tensor, noise_graphs))
     g2 = g2_original.copy()
-
 
     max_x_g1 = max(data['center'][0] for _, data in g1.nodes(data=True))
     min_x_g2 = min(data['center'][0] for _, data in g2.nodes(data=True))
@@ -1020,10 +884,8 @@ def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=Non
         if 'limits' in data:
             data['limits'] = [[x + translation_x, y] for x, y in data['limits']]
 
-
     fig, ax = plt.subplots(figsize=(16, 10))
     legend_added = set()
-
 
     def plot_graph(g, is_g1):
         color_room = 'lightblue' if is_g1 else 'navajowhite'
@@ -1052,10 +914,8 @@ def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=Non
                                 label=f"WS limits {prefix}" if f"limits-{prefix}" not in legend_added else "")
                         legend_added.add(f"limits-{prefix}")
 
-
     plot_graph(g1, is_g1=True)
     plot_graph(g2, is_g1=False)
-
 
     if pred_perm is not None:
         for i in range(pred_perm.shape[0]):
@@ -1071,7 +931,6 @@ def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=Non
                 continue
             pt1 = g1.nodes[id1]['center']
             pt2 = g2.nodes[id2]['center']
-
 
             if gt_perm is not None:
                 if gt_perm[i].sum().item() == 0:
@@ -1090,16 +949,13 @@ def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=Non
                 label = 'Match' if 'predicted' not in legend_added else None
                 key = 'predicted'
 
-
             if key not in legend_added:
                 legend_added.add(key)
             else:
                 label = None
 
-
             ax.plot([pt1[0], pt2[0]], [pt1[1], pt2[1]],
                     color=color, linestyle='-', alpha=0.6, linewidth=1, label=label)
-
 
     ax.set_title("Graph Matching" + (": Green = Correct, Red = Wrong" if gt_perm is not None else ": Predicted matches"))
     ax.axis("equal")
@@ -1111,7 +967,6 @@ def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=Non
         plt.savefig(path)
         plt.close()
 
-
 def normalize_data_pairs(
     pairs: List[Tuple[Data, Data, torch.Tensor]],
     mean: torch.Tensor,
@@ -1120,12 +975,10 @@ def normalize_data_pairs(
     """
     Normalizza per-feature i tensori x in ciascun Data object all'interno delle tuple.
 
-
     Args:
         pairs: Lista di tuple (Data1, Data2, P)
         mean: Tensor di media per-feature (shape: [num_features])
         std: Tensor di deviazione standard per-feature (shape: [num_features])
-
 
     Returns:
         Lista di tuple con i Data normalizzati.
@@ -1137,15 +990,12 @@ def normalize_data_pairs(
         normalized_pairs.append((data1, data2, P))
     return normalized_pairs
 
-
 def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Calcola la media e la deviazione standard per-feature dai Data objects nel training set.
 
-
     Args:
         pairs: Lista di tuple (Data1, Data2, P) del training set
-
 
     Returns:
         Tuple contenente (mean, std) per-feature
@@ -1159,7 +1009,6 @@ def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torc
     std = x_all.std(dim=0)
     return mean, std
 
-
 def predict_matching_matrix(model, data1, data2, discrete: bool = True):
     """
     Produces a matching matrix between data1 and data2.
@@ -1169,26 +1018,21 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True):
     model.eval()
     device = next(model.parameters()).device
 
-
     with torch.no_grad():
         data1 = data1.to(device)
         data2 = data2.to(device)
         batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
         batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
 
-
         sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2, inference=discrete)
         sim = sim_matrix_list[0].unsqueeze(0)  # [1, N1, N2]
-
 
         n1 = torch.tensor([sim.shape[1]], dtype=torch.int32, device=device)
         n2 = torch.tensor([sim.shape[2]], dtype=torch.int32, device=device)
     
         return sim.squeeze(0)
 
-
 node_type_mapping = {"room": [1, 0], "ws": [0, 1]}
-
 
 def pyg_data_to_nx_digraph(data: Data, graph_list: List[nx.DiGraph]) -> nx.DiGraph:
     """
@@ -1203,22 +1047,18 @@ def pyg_data_to_nx_digraph(data: Data, graph_list: List[nx.DiGraph]) -> nx.DiGra
     assert hasattr(data, 'name'), \
         "Data object must contain 'name' to match with graph_list."
 
-
     matching_graph = next((g for g in graph_list if g.graph.get('name') == data.name), None)
     if matching_graph is None:
         raise ValueError(f"No graph with name {data.name} found in graph_list.")
-
 
     orig_names = data.node_names
     perm = data.permutation.tolist()
     node_ids = [orig_names[idx] for idx in perm]
 
-
     G = nx.DiGraph()
     for node_id in node_ids:
         if node_id in matching_graph.nodes:
             G.add_node(node_id, **matching_graph.nodes[node_id])
-
 
     for u_idx, v_idx in data.edge_index.t().tolist():
         u = node_ids[u_idx]
@@ -1226,10 +1066,8 @@ def pyg_data_to_nx_digraph(data: Data, graph_list: List[nx.DiGraph]) -> nx.DiGra
         if matching_graph.has_edge(u, v):
             G.add_edge(u, v, **matching_graph.edges[u, v])
 
-
     G.graph['name'] = data.name
     return G
-
 
 def nx_to_pyg_data_preserve_order(graph: nx.DiGraph) -> Data:
     """
@@ -1238,7 +1076,6 @@ def nx_to_pyg_data_preserve_order(graph: nx.DiGraph) -> Data:
     """
     node_ids = list(graph.nodes())
     id_map = {nid: i for i, nid in enumerate(node_ids)}
-
 
     x = torch.stack([
         torch.tensor(
@@ -1251,19 +1088,16 @@ def nx_to_pyg_data_preserve_order(graph: nx.DiGraph) -> Data:
         for n in node_ids
     ])
 
-
     edge_index = torch.tensor(
         [[id_map[u], id_map[v]] for u, v in graph.edges()],
         dtype=torch.long
     ).t().contiguous() if graph.edges else torch.empty((2, 0), dtype=torch.long)
-
 
     data = Data(x=x, edge_index=edge_index)
     data.name = graph.graph.get('name')
     data.node_names = node_ids
     data.permutation = torch.arange(len(node_ids), dtype=torch.long)
     return data
-
 
 
 def generate_matching_pair_as_data(
@@ -1280,13 +1114,11 @@ def generate_matching_pair_as_data(
     # Convert reference graph
     pyg_g1 = nx_to_pyg_data_preserve_order(g1)
 
-
     # Prepare original names and permutation for g2
     orig_names = list(g2.nodes())
     num_g1 = g1.number_of_nodes()
     num_g2 = len(orig_names)
     perm_indices = torch.randperm(num_g2)
-
 
     # Build permuted g2
     g2_perm = nx.DiGraph()
@@ -1300,12 +1132,10 @@ def generate_matching_pair_as_data(
         if u in orig_to_new and v in orig_to_new:
             g2_perm.add_edge(orig_to_new[u], orig_to_new[v], **data_edge)
 
-
     # Convert permuted graph and attach metadata
     pyg_g2 = nx_to_pyg_data_preserve_order(g2_perm)
     pyg_g2.permutation = perm_indices
     pyg_g2.node_names = orig_names
-
 
     # Build partial assignment ground truth P [|g1| x |g2|]
     P = torch.zeros((num_g1, num_g2), dtype=torch.float32)
@@ -1317,18 +1147,14 @@ def generate_matching_pair_as_data(
             i = g1_ids.index(orig_id)
             P[i, j] = 1.0
 
-
     # Append without transpose to keep shape [|g1|, |g2|]
     pairs_list.append((pyg_g1, pyg_g2, P))
-
 
 def normalize_graph(g1, g2, mean, std):
     g1.x = (g1.x - mean) / (std + 1e-8)
     g2.x = (g2.x - mean) / (std + 1e-8)
 
-
     return g1, g2
-
 
 
 def split_graphs_stratified(
@@ -1352,13 +1178,11 @@ def split_graphs_stratified(
     total = train_frac + val_frac + test_frac
     assert abs(total - 1.0) < 1e-6, "train+val+test fractions must sum to 1.0"
 
-
     # scegli la dimensione su cui stratificare
     if stratify_on == "g1":
         sizes = np.array([g1.num_nodes for g1, g2, P in pairs])
     else:
         sizes = np.array([g2.num_nodes for g1, g2, P in pairs])
-
 
     # quantile‑binning per equal‑frequency
     while n_bins > 1:
@@ -1371,7 +1195,6 @@ def split_graphs_stratified(
         if np.all(counts >= 2):
             break
         n_bins -= 1
-
 
     idx = np.arange(len(pairs))
     if n_bins <= 1:
@@ -1391,14 +1214,11 @@ def split_graphs_stratified(
             random_state=seed, stratify=temp_bins
         )
 
-
     train = [pairs[i] for i in train_idx]
     val   = [pairs[i] for i in val_idx]
     test  = [pairs[i] for i in test_idx]
     return train, val, test
 
-
-#####################################################################
 ###     PARTIAL GRAPH MATCHING MODEL with MLP
 class MatchingModel_GATv2SinkhornTopK(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter: int = 10, sinkhorn_tau: float = 1.0,
@@ -1432,7 +1252,6 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         self.sinkhorn_max_iter = sinkhorn_max_iter
         self.sinkhorn_tau = sinkhorn_tau
 
-
     def encode(self, x, edge_index):
         for i, conv in enumerate(self.gnn):
             x = conv(x, edge_index)
@@ -1440,7 +1259,6 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
                 x = F.relu(x)
                 x = self.dropout(x)
         return x
-
 
     def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False):
         device = next(self.parameters()).device
@@ -1456,17 +1274,14 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         h1 = self.encode(h1, edge1)
         h2 = self.encode(h2, edge2)
 
-
         B = batch_idx1.max().item() + 1
         perm_pred_list = []
         all_embeddings = []
-
 
         for b in range(B):
             h1_b = h1[batch_idx1 == b]   # [n1, d]
             h2_b = h2[batch_idx2 == b]   # [n2, d]
             N1, N2 = h1_b.size(0), h2_b.size(0)
-
 
             # # ---- bilinear affinity ----
             # # scores_{ij} = (h1_b @ A @ h2_b.T) / temperature
@@ -1476,12 +1291,10 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
             # M_batched = M.unsqueeze(0).unsqueeze(1)  # [1,1,n1,n2]
             # M_normed = self.inst_norm(M_batched).squeeze(1)  # [1,n1,n2] -> [n1,n2]
 
-
             # affinity matrix + normalization + sinkhorn
             sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
             sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
             sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
-
 
             n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
             n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
@@ -1497,23 +1310,18 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
                 return_prob=True
             )
 
-
             if inference:
                 perm_pred_list.append(hard_S[0])
             else:
                 perm_pred_list.append(soft_S[0])
 
-
             all_embeddings.append((h1_b, h2_b))
 
-
         return perm_pred_list, all_embeddings
-
 
 # %% [markdown]
 # ## Partial Graph Matching Class
 # 
-
 
 # %%
 # Iperparametri
@@ -1525,7 +1333,6 @@ learning_rate = 1e-3
 batch_size = 16
 weight_decay = 5e-5
 patience = 30
-
 
 class PartialGraphMatching:
     def __init__(
@@ -1556,14 +1363,11 @@ class PartialGraphMatching:
         self.final_model_path = os.path.join(model_save_path, 'final_model.pt')
         self.seed = seed
 
-
         # Load best hyperparameters
         study_path = os.path.join(self.model_save_path, 'study.pkl')
 
-
         with open(study_path, 'rb') as f:
             study = pickle.load(f)
-
 
         best_params = study.best_trial.params
         
@@ -1580,7 +1384,6 @@ class PartialGraphMatching:
         self.sinkhorn_max_iter = best_params['sinkhorn_max_iter'] if sinkhorn_max_iter is None else sinkhorn_max_iter
         self.sinkhorn_tau = best_params['sinkhorn_tau'] if sinkhorn_tau is None else sinkhorn_tau
 
-
         # Model & optimizer
         self.model = model_class(in_dim=self.in_dim, hidden_dim=self.hidden_dim, out_dim=self.out_dim,
                                   dropout_emb=self.dropout_emb, attn_dropout=self.attn_dropout,
@@ -1588,16 +1391,13 @@ class PartialGraphMatching:
                                       sinkhorn_tau=self.sinkhorn_tau).to(device)
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, weight_decay=self.weight_decay)
 
-
         # Load data
         self._load_data_raw(data_paths)
         self._load_data_preprocessed(data_paths)
 
-
         # Training params
         self.num_epochs = num_epochs
         self.patience = patience
-
 
     def _load_data_raw(self, paths):
         self.original_graphs = deserialize_graph_matching_dataset(paths["equal"], "original.pkl")
@@ -1613,9 +1413,7 @@ class PartialGraphMatching:
         for i, g1 in enumerate(self.original_graphs):
             generate_matching_pair_as_data(g1, self.noise_graphs[i], pair_gt_list)
 
-
         train, val, test = split_graphs_stratified(pair_gt_list)
-
 
         # compute mean and std
         mean, std = compute_mean_std(train)
@@ -1623,31 +1421,25 @@ class PartialGraphMatching:
         self.mean = mean
         self.std = std
 
-
     
     def _load_data_preprocessed(self, paths):
         self.train_list = deserialize_graph_matching_dataset(paths["partial"], "train_dataset.pkl")
         self.val_list = deserialize_graph_matching_dataset(paths["partial"], "valid_dataset.pkl")
         self.test_list = deserialize_graph_matching_dataset(paths["partial"], "test_dataset.pkl")
 
-
         self.train_dataset = GraphMatchingDataset(self.train_list)
         self.val_dataset = GraphMatchingDataset(self.val_list)
         self.test_dataset = GraphMatchingDataset(self.test_list)
 
-
         g = torch.Generator().manual_seed(self.seed)
-
 
         self.train_loader = DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
         self.val_loader = DataLoader(self.val_dataset, batch_size=self.batch_size, shuffle=False, collate_fn=collate_pyg_matching)
         self.test_loader = DataLoader(self.test_dataset, batch_size=self.batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
-
     def train(self):
         print(self.model)
         print(f"Number of parameters: {sum(p.numel() for p in self.model.parameters())}")
-
 
         self.train_losses, self.val_losses, self.val_embeddings_history = train_loop(
             model=self.model,
@@ -1662,16 +1454,13 @@ class PartialGraphMatching:
             resume=False
         )
 
-
         plot_losses(self.train_losses, self.val_losses, os.path.join(self.model_save_path, 'losses.png'))
-
 
     def load_best_model(self):
         checkpoint = torch.load(self.best_model_path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.model.to(self.device)
-
 
     def evaluate(self, discrete=True):
         test_acc, test_loss, test_embeddings = evaluate_sinkhorn(self.model, self.test_loader)
@@ -1680,30 +1469,25 @@ class PartialGraphMatching:
         correct = 0
         total_cols = 0
 
-
         for i, (g1_out, g2_perm, gt_perm) in enumerate(self.test_list):
             start_time = time.time()
             result = predict_matching_matrix(self.model, g1_out, g2_perm, discrete=discrete)
             end_time = time.time()
             inference_times.append(end_time - start_time)
 
-
             errors = (result != gt_perm.to(result.device)).sum().item()
             if errors > 0:
                 print(f"Graph {i}: Errors found: {errors}")
-
 
             pred_idx = result.argmax(dim=0)
             target_idx = gt_perm.argmax(dim=0)
             correct += (pred_idx == target_idx).sum().item()
             total_cols += result.shape[1]
 
-
         accuracy = correct / total_cols if total_cols > 0 else 0.0
         print(f"Test Accuracy (after Hungarian): {accuracy:.4f}")
         print(f"Inference time: {np.mean(inference_times):.6f} ± {np.std(inference_times):.6f} seconds")
         return test_acc, test_loss
-
 
     def inference(self, index_to_plot=3, discrete=True):
         g1_out, g2_perm, gt_perm = self.test_list[index_to_plot]
@@ -1720,116 +1504,87 @@ class PartialGraphMatching:
             match_display="all",
         )
 
-
     def infer_matching(self, g1, g2, discrete=True):
-        # (I grafi devono essere in formato NetworkX DiGraph)
         """
-        Effettua il matching tra due grafi.
-
+        Effettua il matching tra due grafi normalizzati.
 
         Args:
-            g1, g2: NetworkX DiGraph graphs
+            model: modello addestrato
+            g1, g2: torch_geometric.data.Data (singola coppia di grafi)
+            mean, std: dizionari di normalizzazione {key: tensor}
             discrete (bool): se True ritorna la matrice hard, altrimenti quella soft
-
 
         Returns:
             matching_matrix: torch.Tensor [N1, N2]
-
-        Note:
-            The matching matrix M[i,j] = 1 means node i of g1 matches node j of g2,
-            where i and j are indices based on the original node order from list(g.nodes()).
         """
-        # # OLD CODE - COMMENTED OUT: Uses generate_matching_pair_as_data which applies
-        # # random permutation to g2 nodes via torch.randperm(). This breaks the index
-        # # correspondence between the matching matrix and the original node IDs.
-        # # The matrix indices no longer match the original node order.
-        # # Preprocessing
-        # original = [g1]
-        # noise = [g2]
-        # g1_pyg = nx_to_pyg_data_preserve_order(g1)
-        # g2_pyg = nx_to_pyg_data_preserve_order(g2)
-        #
-        # pair = []
-        # generate_matching_pair_as_data(
-        #     g1,
-        #     g2,
-        #     pair
-        # )
-        #
-        # # Normalizzazione dei due grafi
-        # g1_pyg, g2_pyg = normalize_graph(pair[0][0], pair[0][1], self.mean, self.std)
-
-        # NEW CODE: Convert graphs to PyG format WITHOUT random permutation.
-        # This preserves the original node order for correct index mapping.
-        # Matrix[i,j] = 1 means g1.nodes()[i] matches g2.nodes()[j]
+        # Preprocessing
+        original = [g1]
+        noise = [g2]
         g1_pyg = nx_to_pyg_data_preserve_order(g1)
         g2_pyg = nx_to_pyg_data_preserve_order(g2)
 
-        # Normalizzazione dei due grafi
-        g1_pyg, g2_pyg = normalize_graph(g1_pyg, g2_pyg, self.mean, self.std)
+        pair = []
+        generate_matching_pair_as_data(
+            g1,
+            g2,
+            pair
+        )
 
+        # Normalizzazione dei due grafi
+        g1_pyg, g2_pyg = normalize_graph(pair[0][0], pair[0][1], self.mean, self.std)
 
         # Calcolo matrice di matching (soft o hard)
         matching_matrix = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete)
 
-
-        # # Visualizza un esempio (COMMENTED OUT - causes RVIZ visualization issues)
-        # plot_two_graphs_with_matching(
-        #     [g1_pyg, g2_pyg],
-        #     pred_perm=matching_matrix,
-        #     original_graphs=[g1],
-        #     noise_graphs=[g2],
-        #     viz_rooms=True,
-        #     viz_ws=True,
-        #     match_display="all"
-        # )
-
+        # Visualizza un esempio
+        plot_two_graphs_with_matching(
+            [g1_pyg, g2_pyg],
+            pred_perm=matching_matrix,
+            original_graphs=original,
+            noise_graphs=noise,
+            viz_rooms=True,
+            viz_ws=True,
+            match_display="all"
+        )
 
         return matching_matrix
 
 
-
 # %% [markdown]
-# # Unit test - COMMENTED OUT TO PREVENT EXECUTION ON IMPORT
+# # Unit test
 # %%
-# When running this as a notebook, uncomment the following lines:
-# GNN_PATH = './GNN/'
-# paths = {
-#     "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
-#     "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
-# }
-# exp = PartialGraphMatching(
-#     model_class=MatchingModel_GATv2SinkhornTopK,
-#     data_paths=paths,
-#     model_save_path=os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise"),
-#     in_dim=in_dim,
-#     device=device
-# )
-# # %%
-# exp.load_best_model()
-#
-# # %%
-# # exp.train()
-# exp.evaluate()
-#
-# # %%
-# exp.inference()
-#
-# # %%
-# matching = exp.infer_matching(exp.original_graphs[1310], exp.noise_graphs[1310])
-# print(matching)
+paths = {
+    "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
+    "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
+}
+exp = PartialGraphMatching(
+    model_class=MatchingModel_GATv2SinkhornTopK,
+    data_paths=paths,
+    model_save_path=os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise"),
+    in_dim=in_dim,
+    device=device
+)
+# %%
+exp.load_best_model()
 
+# %%
+# exp.train()
+exp.evaluate()
+
+# %%
+exp.inference()
+
+# %%
+matching = exp.infer_matching(exp.original_graphs[1310], exp.noise_graphs[1310])
+print(matching)
 
 ####################################################################################################################
-
 
 # # Unit test for GNN graph matching - GATv2 + Sinkhorn + TopK
 # %%    
 
-
 #PROBLEMA: IN GraphMatching.py usa graphwrapper per avere i grafi , qui invece uso direttamente networkx
 #devo creare una classe o funzione che prende in ingresso i grafi ottenuti dal wrapper e li converte in oggetti torch_geometric.data.Data
-
 
 
 #DEVO CAMBIARE IL PATH DEL MODELLO SALVATO
@@ -1847,20 +1602,16 @@ class PartialGraphMatching:
 # %%
 #exp.load_best_model()
 
-
 # %%
 # exp.train()
 #exp.evaluate()
 
-
 # %%
 #exp.inference()
-
 
 # %%
 #matching = exp.infer_matching(exp.original_graphs[1310], exp.noise_graphs[1310])
 #print(matching)
-
 
 
 #####################################################################################################################
