@@ -1187,7 +1187,7 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True):
         return sim.squeeze(0)
 
 
-node_type_mapping = {"room": [1, 0], "ws": [0, 1]}
+node_type_mapping = {"room": [1, 0], "ws": [0, 1]} #Node type encoding
 
 
 def pyg_data_to_nx_digraph(data: Data, graph_list: List[nx.DiGraph]) -> nx.DiGraph:
@@ -1239,7 +1239,7 @@ def nx_to_pyg_data_preserve_order(graph: nx.DiGraph) -> Data:
     node_ids = list(graph.nodes())
     id_map = {nid: i for i, nid in enumerate(node_ids)}
 
-
+    #Node features matrix: [type_onehot, center_x, center_y, normal_x, normal_y, length]
     x = torch.stack([
         torch.tensor(
             node_type_mapping[graph.nodes[n]['type']] +
@@ -1257,6 +1257,17 @@ def nx_to_pyg_data_preserve_order(graph: nx.DiGraph) -> Data:
         dtype=torch.long
     ).t().contiguous() if graph.edges else torch.empty((2, 0), dtype=torch.long)
 
+    # # DEBUG: Print edges fed to the GNN
+    # graph_name = graph.graph.get('name', 'unnamed')
+    # print(f"\n=== EDGES FED TO GNN (graph: {graph_name}) ===")
+    # print(f"Nodes ({len(node_ids)}): {node_ids}")
+    # print(f"Total edges: {graph.number_of_edges()}")
+    # for u, v in graph.edges():
+    #     u_type = graph.nodes[u].get('type', '?')
+    #     v_type = graph.nodes[v].get('type', '?')
+    #     print(f"  {u} ({u_type}) --> {v} ({v_type})")
+    # print(f"edge_index shape: {edge_index.shape}")
+    # print(f"=== END EDGES ===\n")
 
     data = Data(x=x, edge_index=edge_index)
     data.name = graph.graph.get('name')
