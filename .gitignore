@@ -10,3 +10,4 @@ graph_matching/GNN.tar.bz2
 graph_matching/tb_logs
 Colab Notebooks/tb_logs/
 core
+GNN/
