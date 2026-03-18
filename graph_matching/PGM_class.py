@@ -1160,15 +1160,28 @@ def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torc
     return mean, std
 
 
-def predict_matching_matrix(model, data1, data2, discrete: bool = True):
+def predict_matching_matrix(model, data1, data2, discrete: bool = True, affinity_threshold: float = None):
     """
     Produces a matching matrix between data1 and data2.
-    If discrete=True, returns the permutation matrix.
-    Otherwise returns the raw similarity matrix.
+    If discrete=True, returns the hard permutation matrix.
+    Otherwise returns the raw soft similarity matrix.
+
+    Args:
+        affinity_threshold: when set (e.g. 0.0), affinity entries below this value
+                            are masked to -inf before Sinkhorn, so normalization only
+                            distributes mass over plausible pairs. A node whose best
+                            candidate is masked can still find its second-best match.
+                            Since sim_normed is ~zero-mean after InstanceNorm,
+                            threshold=0 means "keep only above-average affinities".
+
+    # COMMENTED OUT - Post soft-topk threshold approach (kept for reference):
+    # threshold: when set (e.g. 0.5), hard assignments whose soft score is
+    #            below the threshold are zeroed out, effectively rejecting
+    #            low-confidence matches that soft-topk would otherwise force.
+    #            Drawback: a masked node loses its match entirely (FN risk).
     """
     model.eval()
     device = next(model.parameters()).device
-
 
     with torch.no_grad():
         data1 = data1.to(device)
@@ -1176,15 +1189,17 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True):
         batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
         batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
 
+        # # --- Post soft-topk threshold (commented out) ---
+        # if threshold is not None and discrete:
+        #     hard_list, _, soft_list = model(data1, data2, batch_idx1, batch_idx2,
+        #                                     inference=True, return_soft=True)
+        #     hard = hard_list[0]   # [N1, N2] binary
+        #     soft = soft_list[0]   # [N1, N2] in [0, 1]
+        #     return hard * (soft >= threshold).float()
 
-        sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2, inference=discrete)
-        sim = sim_matrix_list[0].unsqueeze(0)  # [1, N1, N2]
-
-
-        n1 = torch.tensor([sim.shape[1]], dtype=torch.int32, device=device)
-        n2 = torch.tensor([sim.shape[2]], dtype=torch.int32, device=device)
-    
-        return sim.squeeze(0)
+        sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2,
+                                   inference=discrete, affinity_threshold=affinity_threshold)
+        return sim_matrix_list[0]
 
 
 node_type_mapping = {"room": [1, 0], "ws": [0, 1]} #Node type encoding
@@ -1453,14 +1468,14 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         return x
 
 
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False):
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False, return_soft=False, affinity_threshold=None):
         device = next(self.parameters()).device
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
-        
+
         batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
         batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
-        
+
         # Apply MLP before GNN
         h1 = self.mlp(x1)
         h2 = self.mlp(x2)
@@ -1470,6 +1485,7 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 
         B = batch_idx1.max().item() + 1
         perm_pred_list = []
+        soft_pred_list = []
         all_embeddings = []
 
 
@@ -1493,14 +1509,25 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
             sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
             sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
 
+            # Pre-Sinkhorn affinity threshold: zero out low-confidence candidates
+            # before normalization so Sinkhorn only distributes mass over plausible pairs.
+            # A masked node can still find a second-best match (unlike post-topk filtering).
+            # threshold=0 means "keep only above-average affinities" (sim_normed is ~zero-mean).
+            if affinity_threshold is not None:
+                sim_masked = sim_normed.masked_fill(sim_normed < affinity_threshold, float('-inf'))
+                # Safety guard: if a row is entirely masked, Sinkhorn gets a zero row
+                # sum → NaN propagates through the whole matrix. For those rows, fall
+                # back to the unmasked sim_normed so the node still has candidates.
+                row_all_masked = (sim_masked == float('-inf')).all(dim=-1, keepdim=True)  # [N1, 1]
+                sim_normed = torch.where(row_all_masked, sim_normed, sim_masked)
 
             n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
             n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
             S = pygmtools.sinkhorn(sim_normed, n1=n1_t, n2=n2_t, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
-            
+
             ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
-            
-            hard_S, soft_S = soft_topk(
+
+            hard_S, soft_S = soft_topk(                 #soft_topk restituisce sia la matrice di permutazione discreta (hard_S) che la matrice di similarità continua (soft_S)
                 S, ks_gt,
                 max_iter=self.sinkhorn_max_iter,
                 tau=self.sinkhorn_tau,
@@ -1514,10 +1541,14 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
             else:
                 perm_pred_list.append(soft_S[0])
 
+            # Always collect soft scores so threshold filtering can use them
+            soft_pred_list.append(soft_S[0])
 
             all_embeddings.append((h1_b, h2_b))
 
 
+        if return_soft:
+            return perm_pred_list, all_embeddings, soft_pred_list
         return perm_pred_list, all_embeddings
 
 
@@ -1732,7 +1763,7 @@ class PartialGraphMatching:
         )
 
 
-    def infer_matching(self, g1, g2, discrete=True):
+    def infer_matching(self, g1, g2, discrete=True, affinity_threshold=None):
         # (I grafi devono essere in formato NetworkX DiGraph)
         """
         Effettua il matching tra due grafi.
@@ -1781,7 +1812,7 @@ class PartialGraphMatching:
 
 
         # Calcolo matrice di matching (soft o hard)
-        matching_matrix = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete)
+        matching_matrix = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, affinity_threshold=affinity_threshold)
 
 
         # # Visualizza un esempio (COMMENTED OUT - causes RVIZ visualization issues)
