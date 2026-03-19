@@ -1160,7 +1160,7 @@ def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torc
     return mean, std
 
 
-def predict_matching_matrix(model, data1, data2, discrete: bool = True, affinity_threshold: float = None):
+def predict_matching_matrix(model, data1, data2, discrete: bool = True, affinity_threshold: float = None, score_threshold: float = None):
     """
     Produces a matching matrix between data1 and data2.
     If discrete=True, returns the hard permutation matrix.
@@ -1173,12 +1173,10 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True, affinity
                             candidate is masked can still find its second-best match.
                             Since sim_normed is ~zero-mean after InstanceNorm,
                             threshold=0 means "keep only above-average affinities".
-
-    # COMMENTED OUT - Post soft-topk threshold approach (kept for reference):
-    # threshold: when set (e.g. 0.5), hard assignments whose soft score is
-    #            below the threshold are zeroed out, effectively rejecting
-    #            low-confidence matches that soft-topk would otherwise force.
-    #            Drawback: a masked node loses its match entirely (FN risk).
+        score_threshold: when set (e.g. 0.5), hard assignments whose soft score is
+                         below the threshold are zeroed out, effectively rejecting
+                         low-confidence matches that soft-topk would otherwise force.
+                         Drawback: a rejected node loses its match entirely (FN risk).
     """
     model.eval()
     device = next(model.parameters()).device
@@ -1189,13 +1187,14 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True, affinity
         batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
         batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
 
-        # # --- Post soft-topk threshold (commented out) ---
-        # if threshold is not None and discrete:
-        #     hard_list, _, soft_list = model(data1, data2, batch_idx1, batch_idx2,
-        #                                     inference=True, return_soft=True)
-        #     hard = hard_list[0]   # [N1, N2] binary
-        #     soft = soft_list[0]   # [N1, N2] in [0, 1]
-        #     return hard * (soft >= threshold).float()
+        # --- Post soft-topk threshold ---
+        if score_threshold is not None and discrete:
+            hard_list, _, soft_list = model(data1, data2, batch_idx1, batch_idx2,
+                                            inference=True, return_soft=True,
+                                            affinity_threshold=affinity_threshold)
+            hard = hard_list[0]   # [N1, N2] binary
+            soft = soft_list[0]   # [N1, N2] in [0, 1]
+            return hard * (soft >= score_threshold).float()
 
         sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2,
                                    inference=discrete, affinity_threshold=affinity_threshold)
@@ -1763,7 +1762,7 @@ class PartialGraphMatching:
         )
 
 
-    def infer_matching(self, g1, g2, discrete=True, affinity_threshold=None):
+    def infer_matching(self, g1, g2, discrete=True, affinity_threshold=None, score_threshold=None):
         # (I grafi devono essere in formato NetworkX DiGraph)
         """
         Effettua il matching tra due grafi.
@@ -1812,7 +1811,7 @@ class PartialGraphMatching:
 
 
         # Calcolo matrice di matching (soft o hard)
-        matching_matrix = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, affinity_threshold=affinity_threshold)
+        matching_matrix = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, affinity_threshold=affinity_threshold, score_threshold=score_threshold)
 
 
         # # Visualizza un esempio (COMMENTED OUT - causes RVIZ visualization issues)
