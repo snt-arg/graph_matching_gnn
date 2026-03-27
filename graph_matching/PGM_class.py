@@ -1160,23 +1160,29 @@ def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torc
     return mean, std
 
 
-def predict_matching_matrix(model, data1, data2, discrete: bool = True, affinity_threshold: float = None, score_threshold: float = None):
+def predict_matching_matrix(model, data1, data2, discrete: bool = True, sinkhorn_threshold: float = None, score_threshold: float = None, acc_threshold: float = None):
     """
     Produces a matching matrix between data1 and data2.
     If discrete=True, returns the hard permutation matrix.
     Otherwise returns the raw soft similarity matrix.
 
     Args:
-        affinity_threshold: when set (e.g. 0.0), affinity entries below this value
-                            are masked to -inf before Sinkhorn, so normalization only
-                            distributes mass over plausible pairs. A node whose best
-                            candidate is masked can still find its second-best match.
-                            Since sim_normed is ~zero-mean after InstanceNorm,
-                            threshold=0 means "keep only above-average affinities".
+        sinkhorn_threshold: when set, entries in the doubly-stochastic matrix S
+                            below this value are zeroed before Hungarian, so the
+                            solver avoids weak pairs without redistributing mass
+                            through Sinkhorn. S values are in [0, 1], so the
+                            threshold should be in that range (e.g. 0.1, 0.2).
+                            A row/col fallback ensures every node retains at least
+                            one candidate if all its entries fall below the threshold.
         score_threshold: when set (e.g. 0.5), hard assignments whose soft score is
                          below the threshold are zeroed out, effectively rejecting
                          low-confidence matches that soft-topk would otherwise force.
                          Drawback: a rejected node loses its match entirely (FN risk).
+        acc_threshold: when set, entries in the raw dot-product similarity matrix
+                       (before instance normalisation) below this value are masked
+                       to -inf in sim_normed before Sinkhorn. The mask is derived
+                       from the raw scores so the threshold has a consistent absolute
+                       scale across pairs. A row/col fallback applies as above.
     """
     model.eval()
     device = next(model.parameters()).device
@@ -1191,13 +1197,15 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True, affinity
         if score_threshold is not None and discrete:
             hard_list, _, soft_list = model(data1, data2, batch_idx1, batch_idx2,
                                             inference=True, return_soft=True,
-                                            affinity_threshold=affinity_threshold)
+                                            sinkhorn_threshold=sinkhorn_threshold,
+                                            acc_threshold=acc_threshold)
             hard = hard_list[0]   # [N1, N2] binary
             soft = soft_list[0]   # [N1, N2] in [0, 1]
             return hard * (soft >= score_threshold).float()
 
         sim_matrix_list, _ = model(data1, data2, batch_idx1, batch_idx2,
-                                   inference=discrete, affinity_threshold=affinity_threshold)
+                                   inference=discrete, sinkhorn_threshold=sinkhorn_threshold,
+                                   acc_threshold=acc_threshold)
         return sim_matrix_list[0]
 
 
@@ -1467,7 +1475,7 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         return x
 
 
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False, return_soft=False, affinity_threshold=None):
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False, return_soft=False, sinkhorn_threshold=None, acc_threshold=None, return_intermediate=False):
         device = next(self.parameters()).device
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
@@ -1486,6 +1494,8 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         perm_pred_list = []
         soft_pred_list = []
         all_embeddings = []
+        affinity_list = []
+        sinkhorn_list = []
 
 
         for b in range(B):
@@ -1506,19 +1516,31 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
             # affinity matrix + normalization + sinkhorn
             sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
             sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
-            sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
+            sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,1,n1,n2] -> [1,n1,n2]
 
-            # Pre-Sinkhorn affinity threshold: zero out low-confidence candidates
-            # before normalization so Sinkhorn only distributes mass over plausible pairs.
-            # A masked node can still find a second-best match (unlike post-topk filtering).
-            # threshold=0 means "keep only above-average affinities" (sim_normed is ~zero-mean).
-            if affinity_threshold is not None:
-                sim_masked = sim_normed.masked_fill(sim_normed < affinity_threshold, float('-inf'))
-                # Safety guard: if a row is entirely masked, Sinkhorn gets a zero row
-                # sum → NaN propagates through the whole matrix. For those rows, fall
-                # back to the unmasked sim_normed so the node still has candidates.
-                row_all_masked = (sim_masked == float('-inf')).all(dim=-1, keepdim=True)  # [N1, 1]
-                sim_normed = torch.where(row_all_masked, sim_normed, sim_masked)
+            # --- original pre-Sinkhorn affinity threshold (commented out) ---
+            # Masking sim_normed before Sinkhorn causes mass redistribution:
+            # Sinkhorn enforces row/col sums = 1, so zeroed entries push mass
+            # onto surviving entries, potentially creating new FPs.
+            # Threshold is now applied to S (post-Sinkhorn) at inference time instead.
+            # if sinkhorn_threshold is not None:
+            #     sim_masked = sim_normed.masked_fill(sim_normed < sinkhorn_threshold, float('-inf'))
+            #     row_all_masked = (sim_masked == float('-inf')).all(dim=-1, keepdim=True)  # [1, N1, 1]
+            #     col_all_masked = (sim_masked == float('-inf')).all(dim=-2, keepdim=True)  # [1, 1, N2]
+            #     sim_normed = torch.where(row_all_masked | col_all_masked, sim_normed, sim_masked)
+
+            # Pre-normalization accuracy threshold: mask is computed from the raw
+            # dot-product similarity (consistent absolute scale across pairs) and
+            # applied to sim_normed before Sinkhorn.  Using the raw sim avoids the
+            # zero-mean instability of masking on sim_normed directly.
+            if acc_threshold is not None:
+                sim_normed_masked = sim_normed.masked_fill(sim < acc_threshold, float('-inf'))
+                # Strict row/col fallback: restore degenerate rows first, then
+                # only restore columns that are still fully masked after the row pass.
+                row_all_masked = (sim_normed_masked == float('-inf')).all(dim=-1, keepdim=True)  # [1, N1, 1]
+                sim_normed_masked = torch.where(row_all_masked, sim_normed, sim_normed_masked)
+                col_all_masked = (sim_normed_masked == float('-inf')).all(dim=-2, keepdim=True)  # [1, 1, N2]
+                sim_normed = torch.where(col_all_masked, sim_normed, sim_normed_masked)
 
             n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
             n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
@@ -1526,27 +1548,68 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 
             ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
 
-            hard_S, soft_S = soft_topk(                 #soft_topk restituisce sia la matrice di permutazione discreta (hard_S) che la matrice di similarità continua (soft_S)
+            # soft_topk is always run: training uses soft_S (differentiable),
+            # inference previously used hard_S (greedy discretization of a
+            # re-normalized S).  At inference we now bypass soft_topk and apply
+            # Hungarian directly on S so the doubly-stochastic scores are not
+            # distorted by a second Sinkhorn + greedy pass.
+            # Training path is unchanged.
+            # --- original soft_topk (kept for training + easy revert) ---
+            _, soft_S = soft_topk(                 #soft_topk restituisce sia la matrice di permutazione discreta (hard_S) che la matrice di similarità continua (soft_S)
                 S, ks_gt,
                 max_iter=self.sinkhorn_max_iter,
                 tau=self.sinkhorn_tau,
                 nrows=n1_t, ncols=n2_t,
                 return_prob=True
             )
-
+            # hard_S, soft_S = soft_topk(
+            #     S, ks_gt,
+            #     max_iter=self.sinkhorn_max_iter,
+            #     tau=self.sinkhorn_tau,
+            #     nrows=n1_t, ncols=n2_t,
+            #     return_prob=True
+            # )
 
             if inference:
+                # Hungarian on the rectangular doubly-stochastic matrix S gives
+                # the globally optimal one-to-one assignment (k=N1 matches) without
+                # re-normalizing the scores, preserving the discriminative power of S.
+                if sinkhorn_threshold is not None:
+                    # Post-Sinkhorn threshold: zero out low-confidence entries in S
+                    # before Hungarian so it avoids weak pairs without redistributing
+                    # mass through Sinkhorn. S values are in [0, 1] so the threshold
+                    # should be set in that range (e.g. 0.1, 0.2).
+                    S_for_hungarian = S.masked_fill(S < sinkhorn_threshold, 0.0)
+                    # Strict row/col fallback: restore degenerate rows first, then
+                    # only restore columns that are still all-zero after the row pass.
+                    # This avoids contaminating rows that already have strong candidates
+                    # when an unrelated column happens to be degenerate.
+                    row_all_zero = (S_for_hungarian == 0.0).all(dim=-1, keepdim=True)  # [1, N1, 1]
+                    S_for_hungarian = torch.where(row_all_zero, S, S_for_hungarian)
+                    col_all_zero = (S_for_hungarian == 0.0).all(dim=-2, keepdim=True)  # [1, 1, N2]
+                    S_for_hungarian = torch.where(col_all_zero, S, S_for_hungarian)
+                else:
+                    S_for_hungarian = S
+                hard_S = pygmtools.hungarian(S_for_hungarian, n1=n1_t, n2=n2_t)
                 perm_pred_list.append(hard_S[0])
+                # --- original inference path (greedy via soft_topk) ---
+                # perm_pred_list.append(hard_S[0])
             else:
                 perm_pred_list.append(soft_S[0])
 
             # Always collect soft scores so threshold filtering can use them
             soft_pred_list.append(soft_S[0])
 
+            if return_intermediate:
+                affinity_list.append(sim_normed[0].detach())
+                sinkhorn_list.append(S[0].detach())
+
             all_embeddings.append((h1_b, h2_b))
 
 
         if return_soft:
+            if return_intermediate:
+                return perm_pred_list, all_embeddings, soft_pred_list, affinity_list, sinkhorn_list
             return perm_pred_list, all_embeddings, soft_pred_list
         return perm_pred_list, all_embeddings
 
@@ -1762,7 +1825,7 @@ class PartialGraphMatching:
         )
 
 
-    def infer_matching(self, g1, g2, discrete=True, affinity_threshold=None, score_threshold=None):
+    def infer_matching(self, g1, g2, discrete=True, sinkhorn_threshold=None, score_threshold=None, acc_threshold=None):
         # (I grafi devono essere in formato NetworkX DiGraph)
         """
         Effettua il matching tra due grafi.
@@ -1811,7 +1874,7 @@ class PartialGraphMatching:
 
 
         # Calcolo matrice di matching (soft o hard)
-        matching_matrix = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, affinity_threshold=affinity_threshold, score_threshold=score_threshold)
+        matching_matrix = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, sinkhorn_threshold=sinkhorn_threshold, score_threshold=score_threshold, acc_threshold=acc_threshold)
 
 
         # # Visualizza un esempio (COMMENTED OUT - causes RVIZ visualization issues)
