@@ -1446,38 +1446,40 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
             h2_b = h2[batch_idx2 == b]   # [n2, d]
             N1, N2 = h1_b.size(0), h2_b.size(0)
 
-            # # ---- bilinear affinity ----
-            # # scores_{ij} = (h1_b @ A @ h2_b.T) / temperature
-            # scores = (h1_b @ self.A) @ h2_b.T
-            # M = torch.exp(scores / self.temperature)  # [n1, n2]
-            # # normalize and sinkhorn
-            # M_batched = M.unsqueeze(0).unsqueeze(1)  # [1,1,n1,n2]
-            # M_normed = self.inst_norm(M_batched).squeeze(1)  # [1,n1,n2] -> [n1,n2]
-
             # affinity matrix + normalization + sinkhorn
             sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
             sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
-            sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
+            sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2]
 
-            n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
-            n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
-            S = pygmtools.sinkhorn(sim_normed, n1=n1_t, n2=n2_t, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
-            
-            ks_gt = torch.tensor([N2], dtype=torch.long, device=device)
-            
-            hard_S, soft_S = soft_topk(
-                S, ks_gt,
+            # g1 -> A-graph 
+            # g2 -> S-graph (partial)
+            n1_val = h1_b.size(0)
+            n2_val = h2_b.size(0)
+
+            transposed = n1_val > n2_val
+
+            if transposed:
+                # traspose to use dummy_row
+                sim_input = sim_normed.transpose(-2, -1)   # [1, n2, n1]
+                nr = torch.tensor([n2_val], dtype=torch.long, device=device)
+                nc = torch.tensor([n1_val], dtype=torch.long, device=device)
+            else:
+                sim_input = sim_normed                     # [1, n1, n2]
+                nr = torch.tensor([n1_val], dtype=torch.long, device=device)
+                nc = torch.tensor([n2_val], dtype=torch.long, device=device)
+
+            S = pygmtools.sinkhorn(
+                sim_input,
+                n1=nr, n2=nc,
+                dummy_row=(n1_val != n2_val),
                 max_iter=self.sinkhorn_max_iter,
-                tau=self.sinkhorn_tau,
-                nrows=n1_t, ncols=n2_t,
-                return_prob=True
+                tau=self.sinkhorn_tau
             )
 
-            if inference:
-                perm_pred_list.append(hard_S[0])
-            else:
-                perm_pred_list.append(soft_S[0])
+            if transposed:
+                S = S.transpose(-2, -1)   # rollback to [1, n1, n2]
 
+            perm_pred_list.append(S.squeeze(0))  # [n1, n2]
             all_embeddings.append((h1_b, h2_b))
 
         return perm_pred_list, all_embeddings
