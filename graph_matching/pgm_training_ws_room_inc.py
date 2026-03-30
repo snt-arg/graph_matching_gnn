@@ -935,6 +935,7 @@ def collate_pyg_matching(batch):
 ### FUNCTIONS WITH BCE
 def bce_permutation_loss(P, P_gt, eps: float = 1e-9):
     """Element-wise Binary Cross Entropy loss between prediction and ground truth."""
+    assert P.shape == P_gt.shape, f"Shape mismatch: P={P.shape}, P_gt={P_gt.shape}"
     return - (P_gt * torch.log(P + eps) + (1 - P_gt) * torch.log(1 - P + eps)).mean()
 
 def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1e-9):
