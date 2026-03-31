@@ -202,19 +202,38 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
                 # affinity matrix + normalization + sinkhorn
                 sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
                 sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
-                sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2] -> [n1,n2]
+                sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,n1,n2]
 
-                n1 = torch.tensor([h1_b.size(0)], dtype=torch.int32, device=device)
-                n2 = torch.tensor([h2_b.size(0)], dtype=torch.int32, device=device)
-                S = pygmtools.sinkhorn(sim_normed, n1=n1, n2=n2, max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
+                # g1 -> A-graph 
+                # g2 -> S-graph (partial)
+                n1_val = h1_b.size(0)
+                n2_val = h2_b.size(0)
 
-                ks_gt = torch.tensor([h2_b.size(0)], dtype=torch.long, device=device)
+                transposed = n1_val > n2_val
 
-                _, soft_S = soft_topk(S, ks_gt, max_iter=self.sinkhorn_max_iter,
-                                    tau=self.sinkhorn_tau, nrows=n1, ncols=n2,
-                                    return_prob=True)
+                if transposed:
+                    # traspose to use dummy_row
+                    sim_input = sim_normed.transpose(-2, -1)   # [1, n2, n1]
+                    nr = torch.tensor([n2_val], dtype=torch.long, device=device)
+                    nc = torch.tensor([n1_val], dtype=torch.long, device=device)
+                else:
+                    sim_input = sim_normed                     # [1, n1, n2]
+                    nr = torch.tensor([n1_val], dtype=torch.long, device=device)
+                    nc = torch.tensor([n2_val], dtype=torch.long, device=device)
 
-                loss += bce_permutation_loss(soft_S[0], perm_list[b])
+                S = pygmtools.sinkhorn(
+                    sim_input,
+                    n1=nr, n2=nc,
+                    dummy_row=(n1_val != n2_val),
+                    max_iter=self.sinkhorn_max_iter,
+                    tau=self.sinkhorn_tau
+                )
+
+                if transposed:
+                    S = S.transpose(-2, -1)   # rollback to [1, n1, n2]
+
+                loss += bce_permutation_loss(S.squeeze(0), perm_list[b])
+
             return loss / B
 
     model = MatchingModel_GATv2SinkhornTopK_OPT(
@@ -274,6 +293,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
 ### FUNCTIONS WITH BCE
 def bce_permutation_loss(P, P_gt, eps: float = 1e-9):
     """Element-wise Binary Cross Entropy loss between prediction and ground truth."""
+    assert P.shape == P_gt.shape, f"Shape mismatch: P={P.shape}, P_gt={P_gt.shape}"
     return - (P_gt * torch.log(P + eps) + (1 - P_gt) * torch.log(1 - P + eps)).mean()
 
 def deserialize_graph_matching_dataset(path: str, filename: str = "train_dataset.pkl") -> List[Tuple[Data, Data, torch.Tensor]]:
