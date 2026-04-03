@@ -1116,17 +1116,17 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
                 print(f"Early stopping triggered at epoch {epoch}. Best was {best_epoch}.")
                 break
 
-            if epoch == unfreeze_epoch:
-                print(f"Unlocking GNN for progressive fine-tuning at epoch {epoch}")
-                for param in model.gnn.parameters():
-                    param.requires_grad = True
+            # if epoch == unfreeze_epoch:
+            #     print(f"Unlocking GNN for progressive fine-tuning at epoch {epoch}")
+            #     for param in model.gnn.parameters():
+            #         param.requires_grad = True
 
-                # Rebuild optimizer with lower LR for GNN
-                optimizer = torch.optim.Adam([
-                    {"params": model.mlp.parameters(), "lr": 5e-5},
-                    {"params": model.gnn.parameters(), "lr": 5e-5},  # lower learning rate
-                    {"params": model.inst_norm.parameters(), "lr": 1e-4},
-                ], weight_decay=1e-4)
+            #     # Rebuild optimizer with lower LR for GNN
+            #     optimizer = torch.optim.Adam([
+            #         {"params": model.mlp.parameters(), "lr": 5e-5},
+            #         {"params": model.gnn.parameters(), "lr": 5e-5},  # lower learning rate
+            #         {"params": model.inst_norm.parameters(), "lr": 1e-4},
+            #     ], weight_decay=1e-4)
 
     except KeyboardInterrupt:
         print("Training interrupted manually (Ctrl+C).")
@@ -1454,25 +1454,22 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 
             # g1 -> A-graph 
             # g2 -> S-graph (partial)
-            n1_val = h1_b.size(0)
-            n2_val = h2_b.size(0)
-
-            transposed = n1_val > n2_val
+            transposed = N1 > N2
 
             if transposed:
                 # traspose to use dummy_row
                 sim_input = sim_normed.transpose(-2, -1)   # [1, n2, n1]
-                nr = torch.tensor([n2_val], dtype=torch.long, device=device)
-                nc = torch.tensor([n1_val], dtype=torch.long, device=device)
+                nr = torch.tensor([N2], dtype=torch.long, device=device)
+                nc = torch.tensor([N1], dtype=torch.long, device=device)
             else:
                 sim_input = sim_normed                     # [1, n1, n2]
-                nr = torch.tensor([n1_val], dtype=torch.long, device=device)
-                nc = torch.tensor([n2_val], dtype=torch.long, device=device)
+                nr = torch.tensor([N1], dtype=torch.long, device=device)
+                nc = torch.tensor([N2], dtype=torch.long, device=device)
 
             S = pygmtools.sinkhorn(
                 sim_input,
                 n1=nr, n2=nc,
-                dummy_row=(n1_val != n2_val),
+                dummy_row=(N1 != N2),
                 max_iter=self.sinkhorn_max_iter,
                 tau=self.sinkhorn_tau
             )
@@ -1961,6 +1958,9 @@ heads = best_params['heads']
 sinkhorn_max_iter = best_params['sinkhorn_max_iter']
 sinkhorn_tau = best_params['sinkhorn_tau']
 
+print(f"Best hyperparameters: {best_params}")
+print(f"Best trial value (validation loss): {study.best_trial.value:.4f}")
+
 # Modello e ottimizzatore
 model = MatchingModel_GATv2SinkhornTopK(
     in_dim=in_dim,
@@ -1984,88 +1984,90 @@ writer = setup_tb_logger(
 )
 
 #model summary
-print(model)
-print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
+# print(model)
+# print(f"Number of parameters: {sum(p.numel() for p in model.parameters())}")
 checkpoint = torch.load(best_val_model_path, map_location=device)
 model.load_state_dict(checkpoint['model_state_dict'])
 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
 
 model.to(device)
 
-# Evaluate on the test set
-test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
-print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
+# SKIP TESTS ON PRETRAINED MODEL
+# # Evaluate on the test set
+# test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
+# print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
 
-inference_times = []
-# use the model to predict the matching on a test graph
-correct = 0
-total_cols = 0
+# inference_times = []
+# # use the model to predict the matching on a test graph
+# correct = 0
+# total_cols = 0
 
-for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
-    start_time = time.time()
-    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
-    end_time = time.time()
-    inference_times.append(end_time - start_time)
-    errors = (result != gt_perm.to(result.device)).sum().item()
-    if errors > 0:
+# for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
+#     start_time = time.time()
+#     result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
+#     end_time = time.time()
+#     inference_times.append(end_time - start_time)
+#     errors = (result != gt_perm.to(result.device)).sum().item()
+#     if errors > 0:
         
-        print(f"Graph {i}: Errors found: {errors}")
+#         print(f"Graph {i}: Errors found: {errors}")
 
-    # Accuracy calculation after hungarian
-    pred_idx = result.argmax(dim=0)
-    target_idx = gt_perm.argmax(dim=0)
-    # Ensure both tensors are on the same device before comparison
-    pred_idx = pred_idx.to(gt_perm.device)
-    target_idx = target_idx.to(gt_perm.device)
-    correct += (pred_idx == target_idx).sum().item()
-    total_cols += result.shape[1]
+#     # Accuracy calculation after hungarian
+#     pred_idx = result.argmax(dim=0)
+#     target_idx = gt_perm.argmax(dim=0)
+#     # Ensure both tensors are on the same device before comparison
+#     pred_idx = pred_idx.to(gt_perm.device)
+#     target_idx = target_idx.to(gt_perm.device)
+#     correct += (pred_idx == target_idx).sum().item()
+#     total_cols += result.shape[1]
 
-accuracy = correct / total_cols if total_cols > 0 else 0.0
-print(f"Test Accuracy (after Hungarian): {accuracy:.4f}")
+# accuracy = correct / total_cols if total_cols > 0 else 0.0
+# print(f"Test Accuracy (after Hungarian): {accuracy:.4f}")
 
-mean_inference_time = np.mean(inference_times)
-std_inference_time = np.std(inference_times)
-print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
-g1_out, g2_perm, gt_perm = test_list[0]
-result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
+# mean_inference_time = np.mean(inference_times)
+# std_inference_time = np.std(inference_times)
+# print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
+# g1_out, g2_perm, gt_perm = test_list[0]
+# result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
 
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=result,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="wrong",
-    path=os.path.join(models_path, "test.png")
-)
-# Freeze MLP
-for param in model.mlp.parameters():
-    param.requires_grad = True
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=result,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="wrong",
+#     path=os.path.join(models_path, "test.png")
+# )
 
-# Freeze GATv2
-for param in model.gnn.parameters():
-    param.requires_grad = True
+# # Freeze MLP
+# for param in model.mlp.parameters():
+#     param.requires_grad = True
 
-# Instance Norm Trainable
-for param in model.inst_norm.parameters():
-    param.requires_grad = True
+# # Freeze GATv2
+# for param in model.gnn.parameters():
+#     param.requires_grad = True
+
+# # Instance Norm Trainable
+# for param in model.inst_norm.parameters():
+#     param.requires_grad = True
 # Percorsi per salvare i modelli
 best_val_model_path = os.path.join(models_path, 'best_val_model.pt')
 final_model_path = os.path.join(models_path, 'final_model.pt')
 
-# Loader
-train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
-test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+# # Loader
+# train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_pyg_matching, generator=g)
+# val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
+# test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model.to(device)
-optimizer = torch.optim.AdamW([
-    {"params": model.gnn.parameters(), "lr": 5e-5},
-    {"params": model.inst_norm.parameters(), "lr": 1e-4}
-], weight_decay=weight_decay)
+# model.to(device)
+# optimizer = torch.optim.AdamW([
+#     {"params": model.gnn.parameters(), "lr": 5e-5},
+#     {"params": model.inst_norm.parameters(), "lr": 1e-4}
+# ], weight_decay=weight_decay)
 
 # Logger TensorBoard
 writer = setup_tb_logger(
@@ -2106,7 +2108,7 @@ total_cols = 0
 
 for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     start_time = time.time()
-    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
+    result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
     end_time = time.time()
     inference_times.append(end_time - start_time)
     errors = (result != gt_perm.to(result.device)).sum().item()
@@ -2130,7 +2132,7 @@ mean_inference_time = np.mean(inference_times)
 std_inference_time = np.std(inference_times)
 print(f"Inference time: {mean_inference_time:.6f} seconds (mean) ± {std_inference_time:.6f} seconds (std)")
 g1_out, g2_perm, gt_perm = test_list[0]
-result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=False)
+result = predict_matching_matrix(model, g1_out, g2_perm, use_hungarian=True)
 
 plot_two_graphs_with_matching(
     [g1_out, g2_perm],
