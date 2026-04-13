@@ -138,7 +138,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
 
 
     # Flexible model for partial matching
-    class MatchingModel_GATv2SinkhornTopK_OPT(nn.Module):
+    class MatchingModel_MLPGATv2Sinkhorn_OPT(nn.Module):
         def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter, sinkhorn_tau,
                     attention_dropout, dropout_emb, num_layers, heads):
             super().__init__()
@@ -236,7 +236,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
 
             return loss / B
 
-    model = MatchingModel_GATv2SinkhornTopK_OPT(
+    model = MatchingModel_MLPGATv2Sinkhorn_OPT(
         in_dim=train_dataset[0][0].x.size(1),
         hidden_dim=hidden_dim,
         out_dim=out_dim,
@@ -295,6 +295,48 @@ def bce_permutation_loss(P, P_gt, eps: float = 1e-9):
     """Element-wise Binary Cross Entropy loss between prediction and ground truth."""
     assert P.shape == P_gt.shape, f"Shape mismatch: P={P.shape}, P_gt={P_gt.shape}"
     return - (P_gt * torch.log(P + eps) + (1 - P_gt) * torch.log(1 - P + eps)).mean()
+
+def weighted_bce_loss(S_pred, S_gt):
+    """
+    Computes the Weighted Binary Cross-Entropy for the Permutation Loss.
+    
+    Args:
+        S_pred (torch.Tensor): Sinkhorn output [B, N, N], probabilities between 0 and 1.
+        S_gt (torch.Tensor): Ground truth matrix [B, N, N], binary values (0 or 1).
+
+    Returns:
+        torch.Tensor: The scalar value of the average loss.
+    """
+    # 1. Compute the positive class weight (pos_weight)
+    # In graph matching, matches (1) are very rare compared to non-matches (0).
+    # pos_weight = (total number of 0s) / (total number of 1s)
+    num_pos = S_gt.sum() 
+    num_neg = (1.0 - S_gt).sum()
+    
+    # Prevents division by zero if the batch has no matches (unlikely but safe)
+    if num_pos > 0:
+        pos_weight = num_neg / num_pos
+    else:
+        pos_weight = torch.tensor(1.0, device=S_pred.device)
+        
+    # 2. Compute BCE without reduction
+    # We use reduction='none' to obtain a loss map of dimension [B, N, N]
+    # S_pred is clipped (or eps is added internally by PyTorch) 
+    # to avoid probabilities exactly equal to 0 or 1 causing NaN in logarithms.
+    bce_loss_map = F.binary_cross_entropy(S_pred, S_gt.float(), reduction='none')
+    
+    # 3. Apply weight to ONLY positive matches
+    # We create a weight matrix with the same dimension as the loss
+    # For each cell: if ground truth is 1, the weight is 'pos_weight', if 0 the weight is 1.
+    weight_matrix = S_gt * pos_weight + (1.0 - S_gt) * 1.0
+    
+    # Multiply the original loss by the weight matrix
+    weighted_bce_loss_map = bce_loss_map * weight_matrix
+    
+    # 4. Final reduction
+    # Compute the mean over the entire tensor to return the scalar
+    return weighted_bce_loss_map.mean()
+
 
 def deserialize_graph_matching_dataset(path: str, filename: str = "train_dataset.pkl") -> List[Tuple[Data, Data, torch.Tensor]]:
     """
