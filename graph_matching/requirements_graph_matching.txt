@@ -94,7 +94,7 @@ sympy==1.13.3
 tensorboard==2.14.0
 tensorboard-data-server==0.7.2
 threadpoolctl==3.5.0
-torch==2.2.2
+torch==2.8.0
 torch-geometric==2.6.1
 tornado==6.4.2
 tqdm==4.67.1
