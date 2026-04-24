@@ -287,6 +287,29 @@ def plot_pair(label_ref: str, X_ref: np.ndarray,
     plt.tight_layout()
     plt.show(block=False)
 
+def plot_pair_individual(label_ref: str, X_ref: np.ndarray,
+                         label_inf: str, X_inf: np.ndarray,
+                         title_prefix: str,
+                         ws_only_from: int = len(FEATURE_NAMES)) -> None:
+    """Plot one figure per feature, each with room and ws side-by-side.
+    For features at index >= ws_only_from, only the ws subplot is shown."""
+    for fi, fname in enumerate(FEATURE_NAMES):
+        node_types = [("ws", 1)] if fi >= ws_only_from else [("room", 0), ("ws", 1)]
+        fig, axes = plt.subplots(1, len(node_types), figsize=(5 * len(node_types), 4))
+        if len(node_types) == 1:
+            axes = [axes]
+        fig.suptitle(f"{title_prefix} — {fname}", fontsize=12)
+        for ax, (tname, col) in zip(axes, node_types):
+            ax.set_title(f"{fname} [{tname}]", fontsize=10)
+            for X, c, lbl, htype in [(X_ref, "steelblue", label_ref, "stepfilled"),
+                                     (X_inf, "coral",     label_inf, "step")]:
+                mask = X[:, col] > X[:, 1 - col]
+                _hist(ax, X[mask], fi, c, lbl, htype)
+            ax.legend(fontsize=8)
+        plt.tight_layout()
+        plt.show(block=False)
+
+
 # ── Printing ──────────────────────────────────────────────────────────────────
 
 def print_stats(X: np.ndarray, label: str) -> None:
@@ -324,14 +347,44 @@ def print_distances(dist: Dict, ref_label: str) -> None:
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def load_real_env_dataset(graph_dicts_dir: str) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Scan a directory of environment subfolders, each containing Online.pkl and Prior.pkl.
+    Aggregates features across all environments.
+    Returns (X_prior [N,7], X_online [N,7]).
+    """
+    prior_parts, online_parts = [], []
+    env_dirs = sorted([
+        d for d in os.listdir(graph_dicts_dir)
+        if os.path.isdir(os.path.join(graph_dicts_dir, d))
+    ])
+    if not env_dirs:
+        print(f"[WARN] No environment subdirectories found in {graph_dicts_dir}")
+        return np.empty((0, 7), dtype=np.float32), np.empty((0, 7), dtype=np.float32)
+
+    for env in env_dirs:
+        env_path = os.path.join(graph_dicts_dir, env)
+        for fname, parts_list in [("Prior.pkl", prior_parts), ("Online.pkl", online_parts)]:
+            fpath = os.path.join(env_path, fname)
+            if not os.path.exists(fpath):
+                print(f"[WARN] Missing {fname} in {env_path}")
+                continue
+            G = load_nx_graph_from_pt(fpath)
+            X = graph_to_feature_matrix(G)
+            if len(X) > 0:
+                parts_list.append(X)
+                print(f"  [{env}] {fname}: {len(X)} nodes")
+
+    X_prior  = np.concatenate(prior_parts,  axis=0) if prior_parts  else np.empty((0, 7), dtype=np.float32)
+    X_online = np.concatenate(online_parts, axis=0) if online_parts else np.empty((0, 7), dtype=np.float32)
+    return X_prior, X_online
+
+
 def main():
     parser = argparse.ArgumentParser(description="Node feature distribution analysis")
-    parser.add_argument("--s_graph",
-                        default=os.path.join(GRAPH_DICTS_DIR, "Online.pkl"),
-                        help="Pickled NetworkX DiGraph for S-graph (Online).")
-    parser.add_argument("--a_graph",
-                        default=os.path.join(GRAPH_DICTS_DIR, "Prior.pkl"),
-                        help="Pickled NetworkX DiGraph for A-graph (Prior).")
+    parser.add_argument("--graph_dicts_dir",
+                        default=GRAPH_DICTS_DIR,
+                        help="Directory containing environment subfolders, each with Prior.pkl and Online.pkl.")
     args = parser.parse_args()
 
     # ── Load training data (preprocessed pkls fed to the network) ─────────────
@@ -347,25 +400,11 @@ def main():
         print("[ERROR] No training node features extracted. Aborting.")
         sys.exit(1)
 
-    # ── Load inference graphs ─────────────────────────────────────────────────
-    X_s = np.empty((0, 7), dtype=np.float32)
-    X_a = np.empty((0, 7), dtype=np.float32)
-
-    if args.s_graph and os.path.exists(args.s_graph):
-        print(f"\nLoading S-graph (Online) from: {args.s_graph}")
-        G_s = load_nx_graph_from_pt(args.s_graph)
-        X_s = graph_to_feature_matrix(G_s)
-        print(f"  {len(X_s)} nodes")
-    else:
-        print(f"\n[INFO] S-graph not found at {args.s_graph} — skipping.")
-
-    if args.a_graph and os.path.exists(args.a_graph):
-        print(f"Loading A-graph (Prior) from: {args.a_graph}")
-        G_a = load_nx_graph_from_pt(args.a_graph)
-        X_a = graph_to_feature_matrix(G_a)
-        print(f"  {len(X_a)} nodes")
-    else:
-        print(f"[INFO] A-graph not found at {args.a_graph} — skipping.")
+    # ── Load real environment dataset (aggregated across all environments) ─────
+    print(f"\nLoading real environment graphs from subfolders in:\n  {args.graph_dicts_dir}")
+    X_a, X_s = load_real_env_dataset(args.graph_dicts_dir)
+    print(f"  A-graph (Prior)  total: {len(X_a)} nodes")
+    print(f"  S-graph (Online) total: {len(X_s)} nodes")
 
     # datasets dict used for box-plot overview (all four together)
     all_datasets: Dict[str, np.ndarray] = {
@@ -458,12 +497,12 @@ def main():
     print("\n--- RAW FEATURE DISTRIBUTIONS (before normalization) ---")
     # plot_pair("train_original [raw]", X_original, "A-graph [raw]", X_a,
     #           "RAW: train_original vs A-graph (Prior)")
-    plot_pair("train_original [raw]", X_original, "A-graph [raw]", X_a,
-              "RAW per type: train_original vs A-graph (Prior)", by_type=True)
+    # plot_pair("train_original [raw]", X_original, "A-graph [raw]", X_a,
+    #           "RAW per type: train_original vs A-graph (Prior)", by_type=True)
     # plot_pair("train_noise [raw]", X_noise, "S-graph [raw]", X_s,
     #           "RAW: train_noise vs S-graph (Online)")
-    plot_pair("train_noise [raw]", X_noise, "S-graph [raw]", X_s,
-              "RAW per type: train_noise vs S-graph (Online)", by_type=True)
+    # plot_pair("train_noise [raw]", X_noise, "S-graph [raw]", X_s,
+    #           "RAW per type: train_noise vs S-graph (Online)", by_type=True)
     #plot_boxplots(all_datasets, "Node Feature Box Plots: RAW")
 
     # ── Plots: NORMALIZED (what the GNN actually sees) ────────────────────────
@@ -472,6 +511,8 @@ def main():
     #           "NORMALIZED: train_original vs A-graph (Prior)")
     plot_pair("train_original [norm]", X_original_n, "A-graph [norm]", X_a_n,
               "NORMALIZED per type: train_original vs A-graph (Prior)", by_type=True)
+    plot_pair_individual("train_original [norm]", X_original_n, "A-graph [norm]", X_a_n,
+                         "NORMALIZED: train_original vs A-graph (Prior)", ws_only_from=2)
     # plot_pair("train_noise [norm]", X_noise_n, "S-graph [norm]", X_s_n,
     #           "NORMALIZED: train_noise vs S-graph (Online)")
     plot_pair("train_noise [norm]", X_noise_n, "S-graph [norm]", X_s_n,
