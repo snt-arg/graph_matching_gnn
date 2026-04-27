@@ -1160,7 +1160,7 @@ def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torc
     return mean, std
 
 
-def predict_matching_matrix(model, data1, data2, discrete: bool = True, sinkhorn_threshold: float = None, score_threshold: float = None, acc_threshold: float = None):
+def predict_matching_matrix(model, data1, data2, discrete: bool = True, sinkhorn_threshold: float = None, score_threshold: float = None, acc_threshold: float = None, mc_samples: int = 0, std_threshold: float = None):
     """
     Produces a matching matrix between data1 and data2.
     If discrete=True, returns the hard permutation matrix.
@@ -1183,16 +1183,60 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True, sinkhorn
                        to -inf in sim_normed before Sinkhorn. The mask is derived
                        from the raw scores so the threshold has a consistent absolute
                        scale across pairs. A row/col fallback applies as above.
+        mc_samples: when > 0, runs Monte Carlo Dropout inference with the given
+                    number of stochastic forward passes. Returns (matrix, uncertainty)
+                    where uncertainty is the per-entry std across passes.
+        std_threshold: when set (requires mc_samples > 0), entries in mean_soft whose
+                       uncertainty exceeds this value are zeroed before Hungarian,
+                       filtering candidates the model was inconsistent about across
+                       passes regardless of their mean score.
+                       A row/col fallback ensures no node loses all its candidates.
     """
-    model.eval()
     device = next(model.parameters()).device
 
-    with torch.no_grad():
-        data1 = data1.to(device)
-        data2 = data2.to(device)
-        batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
-        batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
+    data1 = data1.to(device)
+    data2 = data2.to(device)
+    batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
+    batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
 
+    if mc_samples > 0:
+        model.train()  # keep dropout active for stochastic passes
+        soft_samples = []
+        with torch.no_grad():
+            for _ in range(mc_samples):
+                _, _, soft_list = model(data1, data2, batch_idx1, batch_idx2,
+                                        inference=False, return_soft=True,
+                                        sinkhorn_threshold=sinkhorn_threshold,
+                                        acc_threshold=acc_threshold)
+                soft_samples.append(soft_list[0])
+
+        soft_stack = torch.stack(soft_samples, dim=0)  # [mc_samples, N1, N2]
+        mean_soft = soft_stack.mean(dim=0)             # [N1, N2]
+        uncertainty = soft_stack.std(dim=0)            # [N1, N2]
+
+        if discrete:
+            n1_t = torch.tensor([mean_soft.shape[0]], dtype=torch.int32, device=device)
+            n2_t = torch.tensor([mean_soft.shape[1]], dtype=torch.int32, device=device)
+
+            mean_soft_filtered = mean_soft
+            if std_threshold is not None:
+                mean_soft_filtered = mean_soft.masked_fill(uncertainty > std_threshold, 0.0)
+                # Row fallback: restore rows where all candidates were filtered
+                row_all_zero = (mean_soft_filtered == 0.0).all(dim=-1, keepdim=True)
+                mean_soft_filtered = torch.where(row_all_zero, mean_soft, mean_soft_filtered)
+                # Col fallback: restore cols where all candidates were filtered
+                col_all_zero = (mean_soft_filtered == 0.0).all(dim=-2, keepdim=True)
+                mean_soft_filtered = torch.where(col_all_zero, mean_soft, mean_soft_filtered)
+
+            hard = pygmtools.hungarian(mean_soft_filtered.unsqueeze(0), n1=n1_t, n2=n2_t)[0]
+            if score_threshold is not None:
+                hard = hard * (mean_soft >= score_threshold).float()
+            return hard, uncertainty
+        return mean_soft, uncertainty
+
+    # --- Original single-pass path ---
+    model.eval()
+    with torch.no_grad():
         # --- Post soft-topk threshold ---
         if score_threshold is not None and discrete:
             hard_list, _, soft_list = model(data1, data2, batch_idx1, batch_idx2,
@@ -1777,7 +1821,7 @@ class PartialGraphMatching:
         self.model.to(self.device)
 
 
-    def evaluate(self, discrete=True):
+    def evaluate(self, discrete=True, mc_samples=0):
         test_acc, test_loss, test_embeddings = evaluate_sinkhorn(self.model, self.test_loader)
         print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
         inference_times = []
@@ -1787,8 +1831,9 @@ class PartialGraphMatching:
 
         for i, (g1_out, g2_perm, gt_perm) in enumerate(self.test_list):
             start_time = time.time()
-            result = predict_matching_matrix(self.model, g1_out, g2_perm, discrete=discrete)
+            output = predict_matching_matrix(self.model, g1_out, g2_perm, discrete=discrete, mc_samples=mc_samples)
             end_time = time.time()
+            result = output[0] if mc_samples > 0 else output
             inference_times.append(end_time - start_time)
 
 
@@ -1809,10 +1854,13 @@ class PartialGraphMatching:
         return test_acc, test_loss
 
 
-    def inference(self, index_to_plot=3, discrete=True):
+    def inference(self, index_to_plot=3, discrete=True, mc_samples=0):
         g1_out, g2_perm, gt_perm = self.test_list[index_to_plot]
         print(g1_out.name)
-        result = predict_matching_matrix(self.model, g1_out, g2_perm, discrete=discrete)
+        output = predict_matching_matrix(self.model, g1_out, g2_perm, discrete=discrete, mc_samples=mc_samples)
+        result, uncertainty = output if mc_samples > 0 else (output, None)
+        if uncertainty is not None:
+            print(f"Mean uncertainty: {uncertainty.mean().item():.4f} | Max: {uncertainty.max().item():.4f}")
         plot_two_graphs_with_matching(
             [g1_out, g2_perm],
             gt_perm=gt_perm,
@@ -1825,7 +1873,7 @@ class PartialGraphMatching:
         )
 
 
-    def infer_matching(self, g1, g2, discrete=True, sinkhorn_threshold=None, score_threshold=None, acc_threshold=None):
+    def infer_matching(self, g1, g2, discrete=True, sinkhorn_threshold=None, score_threshold=None, acc_threshold=None, mc_samples=0, std_threshold=None):
         # (I grafi devono essere in formato NetworkX DiGraph)
         """
         Effettua il matching tra due grafi.
@@ -1834,10 +1882,12 @@ class PartialGraphMatching:
         Args:
             g1, g2: NetworkX DiGraph graphs
             discrete (bool): se True ritorna la matrice hard, altrimenti quella soft
+            mc_samples (int): if > 0, runs Monte Carlo Dropout with this many passes.
 
 
         Returns:
             matching_matrix: torch.Tensor [N1, N2]
+            uncertainty: torch.Tensor [N1, N2] per-entry std, only returned when mc_samples > 0
 
         Note:
             The matching matrix M[i,j] = 1 means node i of g1 matches node j of g2,
@@ -1874,7 +1924,7 @@ class PartialGraphMatching:
 
 
         # Calcolo matrice di matching (soft o hard)
-        matching_matrix = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, sinkhorn_threshold=sinkhorn_threshold, score_threshold=score_threshold, acc_threshold=acc_threshold)
+        output = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, sinkhorn_threshold=sinkhorn_threshold, score_threshold=score_threshold, acc_threshold=acc_threshold, mc_samples=mc_samples, std_threshold=std_threshold)
 
 
         # # Visualizza un esempio (COMMENTED OUT - causes RVIZ visualization issues)
@@ -1888,8 +1938,9 @@ class PartialGraphMatching:
         #     match_display="all"
         # )
 
-
-        return matching_matrix
+        if mc_samples > 0:
+            return output  # (matching_matrix, uncertainty)
+        return output
 
 
 
