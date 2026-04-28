@@ -1160,7 +1160,7 @@ def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torc
     return mean, std
 
 
-def predict_matching_matrix(model, data1, data2, discrete: bool = True, sinkhorn_threshold: float = None, score_threshold: float = None, acc_threshold: float = None, mc_samples: int = 0, std_threshold: float = None):
+def predict_matching_matrix(model, data1, data2, discrete: bool = True, sinkhorn_threshold: float = None, score_threshold: float = None, acc_threshold: float = None, mc_samples: int = 0, std_threshold: float = None, mc_affinity_samples: int = 0, affinity_std_threshold: float = None):
     """
     Produces a matching matrix between data1 and data2.
     If discrete=True, returns the hard permutation matrix.
@@ -1183,14 +1183,28 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True, sinkhorn
                        to -inf in sim_normed before Sinkhorn. The mask is derived
                        from the raw scores so the threshold has a consistent absolute
                        scale across pairs. A row/col fallback applies as above.
-        mc_samples: when > 0, runs Monte Carlo Dropout inference with the given
-                    number of stochastic forward passes. Returns (matrix, uncertainty)
-                    where uncertainty is the per-entry std across passes.
+        mc_samples: when > 0, runs Monte Carlo Dropout inference on the Sinkhorn
+                    output with this many stochastic forward passes. Returns
+                    (matrix, uncertainty) where uncertainty is per-entry std across
+                    passes. See also mc_affinity_samples for the faster variant.
         std_threshold: when set (requires mc_samples > 0), entries in mean_soft whose
                        uncertainty exceeds this value are zeroed before Hungarian,
                        filtering candidates the model was inconsistent about across
                        passes regardless of their mean score.
                        A row/col fallback ensures no node loses all its candidates.
+        mc_affinity_samples: when > 0, runs MC Dropout on the raw affinity matrix
+                             instead of the Sinkhorn output. N stochastic GNN passes
+                             collect raw dot-product affinities, which are averaged
+                             and then InstanceNorm + Sinkhorn are applied once.
+                             Saves N-1 Sinkhorn normalizations vs mc_samples mode.
+                             Returns (matrix, uncertainty) where uncertainty is the
+                             per-entry std of raw affinities across passes.
+                             Threshold scale is in raw affinity space, not [0,1].
+        affinity_std_threshold: when set (requires mc_affinity_samples > 0), entries
+                                in mean_sim_normed whose raw-affinity uncertainty
+                                exceeds this value are masked to -inf before Sinkhorn,
+                                filtering inconsistent candidates pre-transport.
+                                A row/col fallback prevents total node elimination.
     """
     device = next(model.parameters()).device
 
@@ -1198,6 +1212,51 @@ def predict_matching_matrix(model, data1, data2, discrete: bool = True, sinkhorn
     data2 = data2.to(device)
     batch_idx1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=device)
     batch_idx2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=device)
+
+    if mc_affinity_samples > 0:
+        model.train()  # keep dropout active for stochastic passes
+        norm_aff_samples = []
+        with torch.no_grad():
+            for _ in range(mc_affinity_samples):
+                # Each pass returns sim_normed[0]: InstanceNorm + acc_threshold already applied.
+                _, _, aff_list = model(data1, data2, batch_idx1, batch_idx2,
+                                       skip_sinkhorn=True, acc_threshold=acc_threshold)
+                norm_aff_samples.append(aff_list[0])  # [N1, N2] normalised affinity
+
+        aff_stack = torch.stack(norm_aff_samples, dim=0)  # [mc_affinity_samples, N1, N2]
+        mean_sim_normed = aff_stack.mean(dim=0).unsqueeze(0)  # [1, N1, N2] mean of normalised affinities
+        uncertainty     = aff_stack.std(dim=0)                # [N1, N2] in normalised affinity space
+
+        N1, N2 = uncertainty.shape
+        n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
+        n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
+
+        # Filter high-uncertainty entries before Sinkhorn
+        if affinity_std_threshold is not None:
+            unc_mask = uncertainty.unsqueeze(0) > affinity_std_threshold  # [1, N1, N2]
+            normed_filtered = mean_sim_normed.masked_fill(unc_mask, float('-inf'))
+            row_all_masked = (normed_filtered == float('-inf')).all(dim=-1, keepdim=True)
+            normed_filtered = torch.where(row_all_masked, mean_sim_normed, normed_filtered)
+            col_all_masked = (normed_filtered == float('-inf')).all(dim=-2, keepdim=True)
+            mean_sim_normed = torch.where(col_all_masked, mean_sim_normed, normed_filtered)
+
+        # Single Sinkhorn pass on the mean normalised affinity
+        S_mean = pygmtools.sinkhorn(mean_sim_normed, n1=n1_t, n2=n2_t,
+                                    max_iter=model.sinkhorn_max_iter, tau=model.sinkhorn_tau)
+
+        if discrete:
+            S_for_hungarian = S_mean
+            if sinkhorn_threshold is not None:
+                S_for_hungarian = S_mean.masked_fill(S_mean < sinkhorn_threshold, 0.0)
+                row_all_zero = (S_for_hungarian == 0.0).all(dim=-1, keepdim=True)
+                S_for_hungarian = torch.where(row_all_zero, S_mean, S_for_hungarian)
+                col_all_zero = (S_for_hungarian == 0.0).all(dim=-2, keepdim=True)
+                S_for_hungarian = torch.where(col_all_zero, S_mean, S_for_hungarian)
+            hard = pygmtools.hungarian(S_for_hungarian, n1=n1_t, n2=n2_t)[0]
+            if score_threshold is not None:
+                hard = hard * (S_mean[0] >= score_threshold).float()
+            return hard, uncertainty
+        return S_mean[0], uncertainty
 
     if mc_samples > 0:
         model.train()  # keep dropout active for stochastic passes
@@ -1519,7 +1578,7 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         return x
 
 
-    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False, return_soft=False, sinkhorn_threshold=None, acc_threshold=None, return_intermediate=False):
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False, return_soft=False, sinkhorn_threshold=None, acc_threshold=None, return_intermediate=False, skip_sinkhorn: bool = False):
         device = next(self.parameters()).device
         x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
         x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
@@ -1559,6 +1618,23 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 
             # affinity matrix + normalization + sinkhorn
             sim = torch.matmul(h1_b, h2_b.T) # [n1, n2]
+
+            # MC-affinity early exit: apply InstanceNorm (and optional acc_threshold mask)
+            # to each stochastic pass individually, so the caller averages N already-
+            # normalised matrices and runs Sinkhorn once on the mean.
+            if skip_sinkhorn:
+                sim_batched_sk = sim.unsqueeze(0).unsqueeze(1)           # [1,1,N1,N2]
+                sim_normed_sk  = self.inst_norm(sim_batched_sk).squeeze(1)  # [1,N1,N2]
+                if acc_threshold is not None:
+                    sim_normed_masked = sim_normed_sk.masked_fill(sim < acc_threshold, float('-inf'))
+                    row_all_masked = (sim_normed_masked == float('-inf')).all(dim=-1, keepdim=True)
+                    sim_normed_masked = torch.where(row_all_masked, sim_normed_sk, sim_normed_masked)
+                    col_all_masked = (sim_normed_masked == float('-inf')).all(dim=-2, keepdim=True)
+                    sim_normed_sk = torch.where(col_all_masked, sim_normed_sk, sim_normed_masked)
+                affinity_list.append(sim_normed_sk[0].detach())          # [N1,N2]
+                all_embeddings.append((h1_b, h2_b))
+                continue
+
             sim_batched = sim.unsqueeze(0).unsqueeze(1) # [1,1,n1,n2]
             sim_normed = self.inst_norm(sim_batched).squeeze(1) # [1,1,n1,n2] -> [1,n1,n2]
 
@@ -1650,6 +1726,9 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
 
             all_embeddings.append((h1_b, h2_b))
 
+
+        if skip_sinkhorn:
+            return [], all_embeddings, affinity_list
 
         if return_soft:
             if return_intermediate:
@@ -1873,7 +1952,7 @@ class PartialGraphMatching:
         )
 
 
-    def infer_matching(self, g1, g2, discrete=True, sinkhorn_threshold=None, score_threshold=None, acc_threshold=None, mc_samples=0, std_threshold=None):
+    def infer_matching(self, g1, g2, discrete=True, sinkhorn_threshold=None, score_threshold=None, acc_threshold=None, mc_samples=0, std_threshold=None, mc_affinity_samples=0, affinity_std_threshold=None):
         # (I grafi devono essere in formato NetworkX DiGraph)
         """
         Effettua il matching tra due grafi.
@@ -1924,7 +2003,7 @@ class PartialGraphMatching:
 
 
         # Calcolo matrice di matching (soft o hard)
-        output = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, sinkhorn_threshold=sinkhorn_threshold, score_threshold=score_threshold, acc_threshold=acc_threshold, mc_samples=mc_samples, std_threshold=std_threshold)
+        output = predict_matching_matrix(self.model, g1_pyg, g2_pyg, discrete=discrete, sinkhorn_threshold=sinkhorn_threshold, score_threshold=score_threshold, acc_threshold=acc_threshold, mc_samples=mc_samples, std_threshold=std_threshold, mc_affinity_samples=mc_affinity_samples, affinity_std_threshold=affinity_std_threshold)
 
 
         # # Visualizza un esempio (COMMENTED OUT - causes RVIZ visualization issues)
@@ -1938,7 +2017,7 @@ class PartialGraphMatching:
         #     match_display="all"
         # )
 
-        if mc_samples > 0:
+        if mc_samples > 0 or mc_affinity_samples > 0:
             return output  # (matching_matrix, uncertainty)
         return output
 
