@@ -10,14 +10,12 @@ import subprocess
 import sys
 
 # Install required packages
-subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas",
-                        "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
-
+subprocess.check_call(["uv", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
 # Check if pygmtools is installed
 try:
     import pygmtools
 except ImportError:#pygmtools library
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"])
+    subprocess.check_call(["uv", "pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"])
 
 # Check pytorch version and make sure you use a GPU Kernel
 import torch
@@ -383,7 +381,7 @@ print("Loading dataset...")
 #load preprocessed dataset
 gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
 gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise_inc")
-models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise_inc")
+models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise_inc_BCE")
 
 original_graphs = deserialize_graph_matching_dataset(
     gm_equal_preprocessed_path,
@@ -411,7 +409,7 @@ train_dataset = GraphMatchingDataset(train_list)
 val_dataset = GraphMatchingDataset(val_list)
 test_dataset = GraphMatchingDataset(test_list)
 
-print("Continuing hyperparameter optimization...")
+print("Continuing hyperparameter optimization BCE...")
 
 study_path = os.path.join(models_path, "study.pkl")
 
@@ -434,4 +432,4 @@ with open(study_path, "wb") as f:
 # Plot the study results
 fig = optuna.visualization.plot_optimization_history(study)
 fig.write_html(os.path.join(models_path, "opt_history.html"))
-fig.write_image(os.path.join(models_path, "opt_history.png"))
+# fig.write_image(os.path.join(models_path, "opt_history.png"))

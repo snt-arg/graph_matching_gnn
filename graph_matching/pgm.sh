@@ -2,7 +2,7 @@
 #SBATCH -c 1
 #SBATCH --time=0-48:00:00
 #SBATCH -p gpu
-#SBATCH --gres=gpu
+#SBATCH --gres=gpu:1
 #SBATCH --mail-type=END,FAIL
 #SBATCH --mail-user=matteogiorgi196@gmail.com
 
@@ -18,11 +18,6 @@ module list 2>&1
 
 # Spostati nella directory da cui hai inviato il job (fondamentale per path relativi)
 cd $SLURM_SUBMIT_DIR || exit 1
-
-# Caricamento ambiente
-module purge
-module load env/legacy/2020b
-module load lang/Python/3.8.6-GCCcore-10.2.0
 
 # Attiva virtualenv
 echo "Activating virtualenv..."
@@ -55,10 +50,16 @@ echo "Launching Python script..."
 # python3 -u optimization_gm.py 
 # python3 -u optimization_ws.py 
 # python3 -u optimization_room.py 
-# python3 -u optimization_ws_room.py 
+# python3 -u optimization_ws_room_inc_BCE_noMLP.py 
+# python3 -u optimization_ws_room_inc_BCE.py 
+# python3 -u optimization_ws_room_inc_WBCE.py 
+
 # python3 -u embedding_debug.py 
 # python3 -u pgm_training_ws_room.py
-python3 -u pgm_training_ws_room_inc.py
+# python3 -u pgm_training_ws_room_inc.py
+# python3 -u pgm_training_ws_room_inc_BCE_noMLP.py 
+# python3 -u pgm_training_ws_room_inc_BCE.py 
+# python3 -u pgm_training_ws_room_inc_WBCE.py 
 
 
 echo "=== SLURM JOB ENDED ==="

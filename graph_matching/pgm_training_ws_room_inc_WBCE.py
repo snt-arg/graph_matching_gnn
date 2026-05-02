@@ -10,14 +10,12 @@ import subprocess
 import sys
 
 # Install required packages
-subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas",
-                        "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
-
+subprocess.check_call(["uv", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
 # Check if pygmtools is installed
 try:
     import pygmtools
 except ImportError:#pygmtools library
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"])
+    subprocess.check_call(["uv", "pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"])
 
 # Check pytorch version and make sure you use a GPU Kernel
 import torch
@@ -850,6 +848,34 @@ def bce_permutation_loss(P, P_gt, eps: float = 1e-9):
     assert P.shape == P_gt.shape, f"Shape mismatch: P={P.shape}, P_gt={P_gt.shape}"
     return - (P_gt * torch.log(P + eps) + (1 - P_gt) * torch.log(1 - P + eps)).mean()
 
+def hard_perm_from_scores(P: torch.Tensor) -> torch.Tensor:
+    """Convert a soft permutation matrix into a hard assignment (one per column)."""
+    hard = torch.zeros_like(P)
+    hard[P.argmax(dim=0), torch.arange(P.shape[1], device=P.device)] = 1
+    return hard
+
+def permutation_accuracy_counts(P_pred_hard: torch.Tensor, P_gt: torch.Tensor) -> Tuple[int, int]:
+    """Return (correct, total) column-wise accuracy counts for permutation matrices."""
+    pred_idx = P_pred_hard.argmax(dim=0)
+    target_idx = P_gt.argmax(dim=0)
+    correct = (pred_idx == target_idx).sum().item()
+    total = P_gt.shape[1]
+    return correct, total
+
+def permutation_confusion_counts(P_pred_hard: torch.Tensor, P_gt: torch.Tensor) -> Tuple[int, int, int]:
+    """Return (tp, fp, fn) counts comparing hard predictions to ground truth."""
+    pred = (P_pred_hard > 0.5).to(P_gt.dtype)
+    tp = (pred * P_gt).sum().item()
+    fp = (pred * (1 - P_gt)).sum().item()
+    fn = ((1 - pred) * P_gt).sum().item()
+    return tp, fp, fn
+
+def permutation_precision_recall_f1(tp: int, fp: int, fn: int, eps: float = 1e-9) -> Tuple[float, float, float]:
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    return precision, recall, f1
+
 def weighted_bce_loss(S_pred, S_gt):
     """
     Computes the Weighted Binary Cross-Entropy for the Permutation Loss.
@@ -896,11 +922,16 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
     Trains one epoch of a Sinkhorn-based graph matching model using Binary Cross Entropy (BCE) loss.
     Returns:
         avg_loss (float): average BCE loss per graph.
+        avg_acc (float): permutation accuracy over all columns.
+        avg_f1 (float): F1 score on hard assignments.
         all_embeddings (list): collected embeddings from the model.
     """
     model.train()
     total_loss = 0.0
     num_graphs = 0
+    correct = 0
+    total_cols = 0
+    tp = fp = fn = 0
     all_embeddings = []
     device = next(model.parameters()).device
 
@@ -917,10 +948,19 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
         # accumulo loss per grafo
         batch_loss = 0.0
         for P, P_gt in zip(pred_perm_list, perm_list):
-            loss = bce_permutation_loss(P, P_gt, eps)  # assume reduction='mean'
+            loss = weighted_bce_loss(P, P_gt, eps)  # assume reduction='mean'
             batch_loss += loss
             total_loss += loss.item()
             num_graphs += 1
+
+            P_hard = hard_perm_from_scores(P)
+            c, t = permutation_accuracy_counts(P_hard, P_gt)
+            correct += c
+            total_cols += t
+            tpi, fpi, fni = permutation_confusion_counts(P_hard, P_gt)
+            tp += tpi
+            fp += fpi
+            fn += fni
 
         batch_loss = batch_loss / len(pred_perm_list)  # per logging/grad
         batch_loss.backward()
@@ -930,7 +970,9 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
         all_embeddings.extend(batch_embeddings)
 
     avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
-    return avg_loss, all_embeddings
+    avg_acc = correct / total_cols if total_cols > 0 else 0.0
+    _, _, avg_f1 = permutation_precision_recall_f1(tp, fp, fn, eps=eps)
+    return avg_loss, avg_acc, avg_f1, all_embeddings
 
 
 def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
@@ -939,12 +981,16 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
     and permutation accuracy.
     Returns:
         avg_acc (float): permutation accuracy over all columns.
+        avg_prec (float): precision on hard assignments.
+        avg_rec (float): recall on hard assignments.
+        avg_f1 (float): F1 score on hard assignments.
         avg_loss (float): average BCE loss per graph.
         all_embeddings (list): collected embeddings from the model.
     """
     model.eval()
     correct = 0
     total_cols = 0
+    tp = fp = fn = 0
     total_loss = 0.0
     num_graphs = 0
     all_embeddings = []
@@ -961,14 +1007,17 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
             pred_perm_list, batch_embeddings = model(batch1, batch2, perm_list, batch_idx1, batch_idx2)
 
             for P, P_gt in zip(pred_perm_list, perm_list):
-                # accuracy
-                pred_idx = P.argmax(dim=0)
-                target_idx = P_gt.argmax(dim=0)
-                correct += (pred_idx == target_idx).sum().item()
-                total_cols += P.shape[1]
+                P_hard = hard_perm_from_scores(P)
+                c, t = permutation_accuracy_counts(P_hard, P_gt)
+                correct += c
+                total_cols += t
+                tpi, fpi, fni = permutation_confusion_counts(P_hard, P_gt)
+                tp += tpi
+                fp += fpi
+                fn += fni
 
                 # loss per grafo
-                loss = bce_permutation_loss(P, P_gt, eps)
+                loss = weighted_bce_loss(P, P_gt, eps)
                 total_loss += loss.item()
                 num_graphs += 1
 
@@ -976,7 +1025,8 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
 
     avg_acc = correct / total_cols if total_cols > 0 else 0.0
     avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
-    return avg_acc, avg_loss, all_embeddings
+    avg_prec, avg_rec, avg_f1 = permutation_precision_recall_f1(tp, fp, fn, eps=eps)
+    return avg_acc, avg_prec, avg_rec, avg_f1, avg_loss, all_embeddings
 
 
 def predict_matching_matrix(model, data1, data2, use_hungarian: bool = True):
@@ -1037,12 +1087,12 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
     try:
         for epoch in range(start_epoch, num_epochs):
             # Train
-            train_loss, _ = train_epoch_sinkhorn(model, train_loader, optimizer, writer, epoch)
+            train_loss, train_acc, train_f1, _ = train_epoch_sinkhorn(model, train_loader, optimizer, writer, epoch)
             # Evaluate
-            val_acc, val_loss, val_embeddings = evaluate_sinkhorn(model, val_loader)
+            val_acc, val_prec, val_rec, val_f1, val_loss, val_embeddings = evaluate_sinkhorn(model, val_loader)
             
-            log_metrics(writer, {"loss": train_loss}, epoch, prefix="train")
-            log_metrics(writer, {"loss": val_loss, "acc": val_acc}, epoch, prefix="val")
+            log_metrics(writer, {"loss": train_loss, "acc": train_acc, "f1": train_f1}, epoch, prefix="train")
+            log_metrics(writer, {"loss": val_loss, "acc": val_acc, "precision": val_prec, "recall": val_rec, "f1": val_f1}, epoch, prefix="val")
 
             train_losses.append(train_loss)
             val_losses.append(val_loss)
@@ -1064,7 +1114,10 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
             else:
                 patience_counter += 1
 
-            print(f"Epoch {epoch:03} | Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f}")
+            print(
+                f"Epoch {epoch:03} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.4f} | Train F1: {train_f1:.4f} "
+                f"| Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.4f} | Val F1: {val_f1:.4f}"
+            )
 
             if patience_counter >= patience:
                 print(f"Early stopping triggered at epoch {epoch}. Best was {best_epoch}.")
@@ -1320,7 +1373,7 @@ def objective_pgm(trial, train_dataset, val_dataset, path):
                 if transposed:
                     S = S.transpose(-2, -1)   # rollback to [1, n1, n2]
 
-                loss += bce_permutation_loss(S.squeeze(0), perm_list[b])
+                loss += weighted_bce_loss(S.squeeze(0), perm_list[b])
 
             return loss / B
 
@@ -1517,7 +1570,7 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
 #load preprocessed dataset
 gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
 gm_local_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise_inc")
-models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise_inc")
+models_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise_inc_WBCE")
 
 original_graphs = deserialize_graph_matching_dataset(
     gm_equal_preprocessed_path,
@@ -1603,7 +1656,7 @@ model.to(device)
 writer = setup_tb_logger(
     base_dir="tb_logs",
     model_name=model._get_name(),
-    dataset_name="PGM_ws_room_dropout_noise_inc",
+    dataset_name="PGM_ws_room_dropout_noise_inc_WBCE",
     experiment_name="exp1"
 )
 
@@ -1621,7 +1674,7 @@ train_losses, val_losses, val_embeddings_history = train_loop(
     best_model_path=best_val_model_path,
     final_model_path=final_model_path,
     patience=150,
-    resume=False,
+    resume=True,
     unfreeze_epoch=5
 )
 
@@ -1633,13 +1686,17 @@ model.load_state_dict(best_checkpoint['model_state_dict'])
 model.to(device)
 
 # Evaluate on the test set
-test_acc, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
-print(f"Test Accuracy: {test_acc:.4f} | Test Loss: {test_loss:.4f}")
+test_acc, test_prec, test_rec, test_f1, test_loss, test_embeddings = evaluate_sinkhorn(model, test_loader)
+print(
+    f"Test Loss: {test_loss:.4f} | Test Acc: {test_acc:.4f} | Test Precision: {test_prec:.4f} "
+    f"| Test Recall: {test_rec:.4f} | Test F1: {test_f1:.4f}"
+)
 
 inference_times = []
 # use the model to predict the matching on a test graph
 correct = 0
 total_cols = 0
+tp = fp = fn = 0
 
 for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     start_time = time.time()
@@ -1651,17 +1708,22 @@ for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
         
         print(f"Graph {i}: Errors found: {errors}")
 
-    # Accuracy calculation after hungarian
-    pred_idx = result.argmax(dim=0)
-    target_idx = gt_perm.argmax(dim=0)
-    # Ensure both tensors are on the same device before comparison
-    pred_idx = pred_idx.to(gt_perm.device)
-    target_idx = target_idx.to(gt_perm.device)
-    correct += (pred_idx == target_idx).sum().item()
-    total_cols += result.shape[1]
+    # Metrics calculation after hungarian
+    result = result.to(gt_perm.device)
+    c, t = permutation_accuracy_counts(result, gt_perm)
+    correct += c
+    total_cols += t
+    tpi, fpi, fni = permutation_confusion_counts(result, gt_perm)
+    tp += tpi
+    fp += fpi
+    fn += fni
 
 accuracy = correct / total_cols if total_cols > 0 else 0.0
-print(f"Test Accuracy (after Hungarian): {accuracy:.4f}")
+precision, recall, f1 = permutation_precision_recall_f1(tp, fp, fn)
+print(
+    f"Test Metrics (after Hungarian): Acc {accuracy:.4f} | Precision {precision:.4f} "
+    f"| Recall {recall:.4f} | F1 {f1:.4f}"
+)
 
 mean_inference_time = np.mean(inference_times)
 std_inference_time = np.std(inference_times)
