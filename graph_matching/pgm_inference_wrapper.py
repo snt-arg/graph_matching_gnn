@@ -32,10 +32,20 @@ def load_pgm_model():
 
     # Needed paths for initialization of the PGM model
     GNN_PATH = '/root/workspace/src/graph_matching_gnn/GNN'
-    model_save_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise")
-    data_paths = {
-        "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
-        "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
+
+    NEW_MODEL = True
+    
+    if NEW_MODEL:
+        model_save_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise_inc_BCE")
+        data_paths = {
+            "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
+            "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise_inc")
+        }
+    else:
+        model_save_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise")
+        data_paths = {
+            "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
+            "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
         }
 
 

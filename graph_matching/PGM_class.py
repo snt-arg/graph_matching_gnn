@@ -1784,15 +1784,26 @@ class PartialGraphMatching:
         self.seed = seed
 
 
-        # Load best hyperparameters
-        study_path = os.path.join(self.model_save_path, 'study.pkl')
-
-
-        with open(study_path, 'rb') as f:
-            study = pickle.load(f)
-
-
-        best_params = study.best_trial.params
+        # Load best hyperparameters — prefer JSON sidecars over study.pkl so that
+        # Optuna version mismatches don't block loading.
+        json_paths = [
+            os.path.join(self.model_save_path, 'best_params.json'),
+            os.path.join(self.model_save_path, 'best_trial_results.json'),
+        ]
+        best_params = None
+        for jp in json_paths:
+            if os.path.exists(jp):
+                import json as _json
+                with open(jp, 'r') as f:
+                    data = _json.load(f)
+                # best_trial_results.json nests params under 'params' key
+                best_params = data.get('params', data)
+                break
+        if best_params is None:
+            study_path = os.path.join(self.model_save_path, 'study.pkl')
+            with open(study_path, 'rb') as f:
+                study = pickle.load(f)
+            best_params = study.best_trial.params
         
         self.learning_rate = best_params['lr'] if learning_rate is None else learning_rate
         self.weight_decay = best_params['weight_decay'] if weight_decay is None else weight_decay
