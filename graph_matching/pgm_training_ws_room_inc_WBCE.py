@@ -854,21 +854,14 @@ def hard_perm_from_scores(P: torch.Tensor) -> torch.Tensor:
     hard[P.argmax(dim=0), torch.arange(P.shape[1], device=P.device)] = 1
     return hard
 
-def permutation_accuracy_counts(P_pred_hard: torch.Tensor, P_gt: torch.Tensor) -> Tuple[int, int]:
-    """Return (correct, total) column-wise accuracy counts for permutation matrices."""
-    pred_idx = P_pred_hard.argmax(dim=0)
-    target_idx = P_gt.argmax(dim=0)
-    correct = (pred_idx == target_idx).sum().item()
-    total = P_gt.shape[1]
-    return correct, total
-
-def permutation_confusion_counts(P_pred_hard: torch.Tensor, P_gt: torch.Tensor) -> Tuple[int, int, int]:
-    """Return (tp, fp, fn) counts comparing hard predictions to ground truth."""
+def permutation_confusion_counts(P_pred_hard: torch.Tensor, P_gt: torch.Tensor) -> Tuple[int, int, int, int]:
+    """Return (tp, fp, fn, tn) counts comparing hard predictions to ground truth."""
     pred = (P_pred_hard > 0.5).to(P_gt.dtype)
     tp = (pred * P_gt).sum().item()
     fp = (pred * (1 - P_gt)).sum().item()
     fn = ((1 - pred) * P_gt).sum().item()
-    return tp, fp, fn
+    tn = ((1 - pred) * (1 - P_gt)).sum().item()
+    return tp, fp, fn, tn
 
 def permutation_precision_recall_f1(tp: int, fp: int, fn: int, eps: float = 1e-9) -> Tuple[float, float, float]:
     precision = tp / (tp + fp + eps)
@@ -929,9 +922,8 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
     model.train()
     total_loss = 0.0
     num_graphs = 0
-    correct = 0
-    total_cols = 0
-    tp = fp = fn = 0
+    total_entries = 0
+    tp = fp = fn = tn = 0
     all_embeddings = []
     device = next(model.parameters()).device
 
@@ -948,19 +940,18 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
         # accumulo loss per grafo
         batch_loss = 0.0
         for P, P_gt in zip(pred_perm_list, perm_list):
-            loss = weighted_bce_loss(P, P_gt, eps)  # assume reduction='mean'
+            loss = weighted_bce_loss(P, P_gt)  # assume reduction='mean'
             batch_loss += loss
             total_loss += loss.item()
             num_graphs += 1
 
             P_hard = hard_perm_from_scores(P)
-            c, t = permutation_accuracy_counts(P_hard, P_gt)
-            correct += c
-            total_cols += t
-            tpi, fpi, fni = permutation_confusion_counts(P_hard, P_gt)
+            tpi, fpi, fni, tni = permutation_confusion_counts(P_hard, P_gt)
             tp += tpi
             fp += fpi
             fn += fni
+            tn += tni
+            total_entries += (tpi + fpi + fni + tni)
 
         batch_loss = batch_loss / len(pred_perm_list)  # per logging/grad
         batch_loss.backward()
@@ -970,7 +961,7 @@ def train_epoch_sinkhorn(model, loader, optimizer, writer, epoch, eps: float = 1
         all_embeddings.extend(batch_embeddings)
 
     avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
-    avg_acc = correct / total_cols if total_cols > 0 else 0.0
+    avg_acc = (tp + tn) / total_entries if total_entries > 0 else 0.0
     _, _, avg_f1 = permutation_precision_recall_f1(tp, fp, fn, eps=eps)
     return avg_loss, avg_acc, avg_f1, all_embeddings
 
@@ -988,9 +979,8 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
         all_embeddings (list): collected embeddings from the model.
     """
     model.eval()
-    correct = 0
-    total_cols = 0
-    tp = fp = fn = 0
+    total_entries = 0
+    tp = fp = fn = tn = 0
     total_loss = 0.0
     num_graphs = 0
     all_embeddings = []
@@ -1008,22 +998,21 @@ def evaluate_sinkhorn(model, loader, eps: float = 1e-9):
 
             for P, P_gt in zip(pred_perm_list, perm_list):
                 P_hard = hard_perm_from_scores(P)
-                c, t = permutation_accuracy_counts(P_hard, P_gt)
-                correct += c
-                total_cols += t
-                tpi, fpi, fni = permutation_confusion_counts(P_hard, P_gt)
+                tpi, fpi, fni, tni = permutation_confusion_counts(P_hard, P_gt)
                 tp += tpi
                 fp += fpi
                 fn += fni
+                tn += tni
+                total_entries += (tpi + fpi + fni + tni)
 
                 # loss per grafo
-                loss = weighted_bce_loss(P, P_gt, eps)
+                loss = weighted_bce_loss(P, P_gt)
                 total_loss += loss.item()
                 num_graphs += 1
 
             all_embeddings.extend(batch_embeddings)
 
-    avg_acc = correct / total_cols if total_cols > 0 else 0.0
+    avg_acc = (tp + tn) / total_entries if total_entries > 0 else 0.0
     avg_loss = total_loss / num_graphs if num_graphs > 0 else 0.0
     avg_prec, avg_rec, avg_f1 = permutation_precision_recall_f1(tp, fp, fn, eps=eps)
     return avg_acc, avg_prec, avg_rec, avg_f1, avg_loss, all_embeddings
@@ -1162,7 +1151,7 @@ def train_loop(model, optimizer, train_loader, val_loader, num_epochs, writer,
 #----------------------------------------
 
 ###     PARTIAL GRAPH MATCHING MODEL with MLP
-class MatchingModel_MLPGATv2Sinkhorn(nn.Module):
+class MatchingModel_MLPGATv2SinkhornWBCE(nn.Module):
     def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter: int = 10, sinkhorn_tau: float = 1.0,
                  attention_dropout: float = 0.1, dropout_emb: float = 0.1, num_layers: int = 2, heads: int = 1):
         super().__init__()
@@ -1637,7 +1626,7 @@ val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False, colla
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_pyg_matching)
 
 # Modello e ottimizzatore
-model = MatchingModel_MLPGATv2Sinkhorn(
+model = MatchingModel_MLPGATv2SinkhornWBCE(
     in_dim=in_dim,
     hidden_dim=hidden_dim,
     out_dim=out_dim,
@@ -1694,9 +1683,8 @@ print(
 
 inference_times = []
 # use the model to predict the matching on a test graph
-correct = 0
-total_cols = 0
-tp = fp = fn = 0
+total_entries = 0
+tp = fp = fn = tn = 0
 
 for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
     start_time = time.time()
@@ -1710,15 +1698,14 @@ for i, (g1_out, g2_perm, gt_perm) in enumerate(test_list):
 
     # Metrics calculation after hungarian
     result = result.to(gt_perm.device)
-    c, t = permutation_accuracy_counts(result, gt_perm)
-    correct += c
-    total_cols += t
-    tpi, fpi, fni = permutation_confusion_counts(result, gt_perm)
+    tpi, fpi, fni, tni = permutation_confusion_counts(result, gt_perm)
     tp += tpi
     fp += fpi
     fn += fni
+    tn += tni
+    total_entries += (tpi + fpi + fni + tni)
 
-accuracy = correct / total_cols if total_cols > 0 else 0.0
+accuracy = (tp + tn) / total_entries if total_entries > 0 else 0.0
 precision, recall, f1 = permutation_precision_recall_f1(tp, fp, fn)
 print(
     f"Test Metrics (after Hungarian): Acc {accuracy:.4f} | Precision {precision:.4f} "
