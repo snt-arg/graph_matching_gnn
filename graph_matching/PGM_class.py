@@ -1737,6 +1737,230 @@ class MatchingModel_GATv2SinkhornTopK(nn.Module):
         return perm_pred_list, all_embeddings
 
 
+#####################################################################
+###     PARTIAL GRAPH MATCHING MODEL with MLP + BCE loss
+class MatchingModel_MLPGATv2SinkhornBCE(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter: int = 10, sinkhorn_tau: float = 1.0,
+                 attn_dropout: float = 0.1, dropout_emb: float = 0.1, num_layers: int = 2, heads: int = 1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_emb),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_emb)
+        )
+        self.gnn = nn.ModuleList()
+        dims = [hidden_dim] * num_layers + [out_dim]
+        for i in range(num_layers):
+            self.gnn.append(
+                GATv2Conv(dims[i], dims[i+1], heads=heads, concat=False, dropout=attn_dropout)
+            )
+        self.dropout = nn.Dropout(p=dropout_emb)
+        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+        self.sinkhorn_max_iter = sinkhorn_max_iter
+        self.sinkhorn_tau = sinkhorn_tau
+
+    def encode(self, x, edge_index):
+        for i, conv in enumerate(self.gnn):
+            x = conv(x, edge_index)
+            if i < len(self.gnn) - 1:
+                x = F.relu(x)
+                x = self.dropout(x)
+        return x
+
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False,
+                return_soft=False, sinkhorn_threshold=None, acc_threshold=None,
+                return_intermediate=False, skip_sinkhorn=False):
+        device = next(self.parameters()).device
+        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
+
+        h1 = self.encode(self.mlp(x1), edge1)
+        h2 = self.encode(self.mlp(x2), edge2)
+
+        B = batch_idx1.max().item() + 1
+        perm_pred_list, soft_pred_list, all_embeddings, affinity_list, sinkhorn_list = [], [], [], [], []
+
+        for b in range(B):
+            h1_b = h1[batch_idx1 == b]
+            h2_b = h2[batch_idx2 == b]
+            N1, N2 = h1_b.size(0), h2_b.size(0)
+            sim = torch.matmul(h1_b, h2_b.T)
+
+            if skip_sinkhorn:
+                sim_normed_sk = self.inst_norm(sim.unsqueeze(0).unsqueeze(1)).squeeze(1)
+                if acc_threshold is not None:
+                    masked = sim_normed_sk.masked_fill(sim < acc_threshold, float('-inf'))
+                    row_all = (masked == float('-inf')).all(dim=-1, keepdim=True)
+                    masked = torch.where(row_all, sim_normed_sk, masked)
+                    col_all = (masked == float('-inf')).all(dim=-2, keepdim=True)
+                    sim_normed_sk = torch.where(col_all, sim_normed_sk, masked)
+                affinity_list.append(sim_normed_sk[0].detach())
+                all_embeddings.append((h1_b, h2_b))
+                continue
+
+            sim_normed = self.inst_norm(sim.unsqueeze(0).unsqueeze(1)).squeeze(1)
+            if acc_threshold is not None:
+                masked = sim_normed.masked_fill(sim < acc_threshold, float('-inf'))
+                row_all = (masked == float('-inf')).all(dim=-1, keepdim=True)
+                masked = torch.where(row_all, sim_normed, masked)
+                col_all = (masked == float('-inf')).all(dim=-2, keepdim=True)
+                sim_normed = torch.where(col_all, sim_normed, masked)
+
+            transposed = N1 > N2
+            sim_input = sim_normed.transpose(-2, -1) if transposed else sim_normed
+            nr = torch.tensor([N2 if transposed else N1], dtype=torch.long, device=device)
+            nc = torch.tensor([N1 if transposed else N2], dtype=torch.long, device=device)
+            S = pygmtools.sinkhorn(sim_input, n1=nr, n2=nc, dummy_row=(N1 != N2),
+                                   max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
+            if transposed:
+                S = S.transpose(-2, -1)
+
+            soft_pred_list.append(S.squeeze(0))
+            if return_intermediate:
+                affinity_list.append(sim_normed[0].detach())
+                sinkhorn_list.append(S[0].detach())
+
+            if inference:
+                S_h = S
+                if sinkhorn_threshold is not None:
+                    S_h = S.masked_fill(S < sinkhorn_threshold, 0.0)
+                    row_z = (S_h == 0.0).all(dim=-1, keepdim=True)
+                    S_h = torch.where(row_z, S, S_h)
+                    col_z = (S_h == 0.0).all(dim=-2, keepdim=True)
+                    S_h = torch.where(col_z, S, S_h)
+                n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
+                n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
+                perm_pred_list.append(pygmtools.hungarian(S_h, n1=n1_t, n2=n2_t)[0])
+            else:
+                perm_pred_list.append(S.squeeze(0))
+            all_embeddings.append((h1_b, h2_b))
+
+        if skip_sinkhorn:
+            return [], all_embeddings, affinity_list
+        if return_soft:
+            if return_intermediate:
+                return perm_pred_list, all_embeddings, soft_pred_list, affinity_list, sinkhorn_list
+            return perm_pred_list, all_embeddings, soft_pred_list
+        return perm_pred_list, all_embeddings
+
+
+#####################################################################
+###     PARTIAL GRAPH MATCHING MODEL without MLP (BCE loss)
+class MatchingModel_GATv2Sinkhorn(nn.Module):
+    def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter: int = 10, sinkhorn_tau: float = 1.0,
+                 attn_dropout: float = 0.1, dropout_emb: float = 0.1, num_layers: int = 2, heads: int = 1):
+        super().__init__()
+        self.gnn = nn.ModuleList()
+        dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
+        for i in range(num_layers):
+            self.gnn.append(
+                GATv2Conv(dims[i], dims[i+1], heads=heads, concat=False, dropout=attn_dropout)
+            )
+        self.dropout = nn.Dropout(p=dropout_emb)
+        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+        self.sinkhorn_max_iter = sinkhorn_max_iter
+        self.sinkhorn_tau = sinkhorn_tau
+
+    def encode(self, x, edge_index):
+        for i, conv in enumerate(self.gnn):
+            x = conv(x, edge_index)
+            if i < len(self.gnn) - 1:
+                x = F.relu(x)
+                x = self.dropout(x)
+        return x
+
+    def forward(self, batch1, batch2, batch_idx1=None, batch_idx2=None, inference=False,
+                return_soft=False, sinkhorn_threshold=None, acc_threshold=None,
+                return_intermediate=False, skip_sinkhorn=False):
+        device = next(self.parameters()).device
+        x1, edge1 = batch1.x.to(device), batch1.edge_index.to(device)
+        x2, edge2 = batch2.x.to(device), batch2.edge_index.to(device)
+        batch_idx1 = batch1.batch.to(device) if batch_idx1 is None else batch_idx1.to(device)
+        batch_idx2 = batch2.batch.to(device) if batch_idx2 is None else batch_idx2.to(device)
+
+        h1 = self.encode(x1, edge1)
+        h2 = self.encode(x2, edge2)
+
+        B = batch_idx1.max().item() + 1
+        perm_pred_list, soft_pred_list, all_embeddings, affinity_list, sinkhorn_list = [], [], [], [], []
+
+        for b in range(B):
+            h1_b = h1[batch_idx1 == b]
+            h2_b = h2[batch_idx2 == b]
+            N1, N2 = h1_b.size(0), h2_b.size(0)
+            sim = torch.matmul(h1_b, h2_b.T)
+
+            if skip_sinkhorn:
+                sim_normed_sk = self.inst_norm(sim.unsqueeze(0).unsqueeze(1)).squeeze(1)
+                if acc_threshold is not None:
+                    masked = sim_normed_sk.masked_fill(sim < acc_threshold, float('-inf'))
+                    row_all = (masked == float('-inf')).all(dim=-1, keepdim=True)
+                    masked = torch.where(row_all, sim_normed_sk, masked)
+                    col_all = (masked == float('-inf')).all(dim=-2, keepdim=True)
+                    sim_normed_sk = torch.where(col_all, sim_normed_sk, masked)
+                affinity_list.append(sim_normed_sk[0].detach())
+                all_embeddings.append((h1_b, h2_b))
+                continue
+
+            sim_normed = self.inst_norm(sim.unsqueeze(0).unsqueeze(1)).squeeze(1)
+            if acc_threshold is not None:
+                masked = sim_normed.masked_fill(sim < acc_threshold, float('-inf'))
+                row_all = (masked == float('-inf')).all(dim=-1, keepdim=True)
+                masked = torch.where(row_all, sim_normed, masked)
+                col_all = (masked == float('-inf')).all(dim=-2, keepdim=True)
+                sim_normed = torch.where(col_all, sim_normed, masked)
+
+            transposed = N1 > N2
+            sim_input = sim_normed.transpose(-2, -1) if transposed else sim_normed
+            nr = torch.tensor([N2 if transposed else N1], dtype=torch.long, device=device)
+            nc = torch.tensor([N1 if transposed else N2], dtype=torch.long, device=device)
+            S = pygmtools.sinkhorn(sim_input, n1=nr, n2=nc, dummy_row=(N1 != N2),
+                                   max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
+            if transposed:
+                S = S.transpose(-2, -1)
+
+            soft_pred_list.append(S.squeeze(0))
+            if return_intermediate:
+                affinity_list.append(sim_normed[0].detach())
+                sinkhorn_list.append(S[0].detach())
+
+            if inference:
+                S_h = S
+                if sinkhorn_threshold is not None:
+                    S_h = S.masked_fill(S < sinkhorn_threshold, 0.0)
+                    row_z = (S_h == 0.0).all(dim=-1, keepdim=True)
+                    S_h = torch.where(row_z, S, S_h)
+                    col_z = (S_h == 0.0).all(dim=-2, keepdim=True)
+                    S_h = torch.where(col_z, S, S_h)
+                n1_t = torch.tensor([N1], dtype=torch.int32, device=device)
+                n2_t = torch.tensor([N2], dtype=torch.int32, device=device)
+                perm_pred_list.append(pygmtools.hungarian(S_h, n1=n1_t, n2=n2_t)[0])
+            else:
+                perm_pred_list.append(S.squeeze(0))
+            all_embeddings.append((h1_b, h2_b))
+
+        if skip_sinkhorn:
+            return [], all_embeddings, affinity_list
+        if return_soft:
+            if return_intermediate:
+                return perm_pred_list, all_embeddings, soft_pred_list, affinity_list, sinkhorn_list
+            return perm_pred_list, all_embeddings, soft_pred_list
+        return perm_pred_list, all_embeddings
+
+
+#####################################################################
+###     PARTIAL GRAPH MATCHING MODEL with MLP + Weighted BCE loss
+class MatchingModel_MLPGATv2SinkhornWBCE(MatchingModel_MLPGATv2SinkhornBCE):
+    """Same architecture as MatchingModel_MLPGATv2SinkhornBCE, trained with weighted BCE."""
+    pass
+
+
+
 # %% [markdown]
 # ## Partial Graph Matching Class
 # 
