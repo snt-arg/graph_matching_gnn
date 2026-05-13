@@ -18,48 +18,54 @@ if PGM_PATH not in sys.path:
     sys.path.append(PGM_PATH)
 
 
-from PGM_class import PartialGraphMatching, MatchingModel_GATv2SinkhornTopK
+from PGM_class import (PartialGraphMatching,
+                       MatchingModel_GATv2SinkhornTopK,
+                       MatchingModel_MLPGATv2SinkhornBCE,
+                       MatchingModel_GATv2Sinkhorn,
+                       MatchingModel_MLPGATv2SinkhornWBCE)
 
+
+# Model to load — pick one:
+#   "ws_room_dropout_noise"               → MatchingModel_GATv2SinkhornTopK  (original, TopK)
+#   "ws_room_dropout_noise_inc_BCE"       → MatchingModel_MLPGATv2SinkhornBCE  (MLP + BCE)
+#   "ws_room_dropout_noise_inc_BCE_noMLP" → MatchingModel_GATv2Sinkhorn  (no MLP, BCE)
+#   "ws_room_dropout_noise_inc_WBCE"      → MatchingModel_MLPGATv2SinkhornWBCE  (MLP + weighted BCE)
+MODEL = "ws_room_dropout_noise_inc_WBCE"
+
+# Map model name → (model_class, preprocessed_data_subfolder)
+_MODEL_CONFIGS = {
+    "ws_room_dropout_noise":               (MatchingModel_GATv2SinkhornTopK,    "ws_room_dropout_noise"),
+    "ws_room_dropout_noise_inc_BCE":       (MatchingModel_MLPGATv2SinkhornBCE,  "ws_room_dropout_noise_inc"),
+    "ws_room_dropout_noise_inc_BCE_noMLP": (MatchingModel_GATv2Sinkhorn,        "ws_room_dropout_noise_inc"),
+    "ws_room_dropout_noise_inc_WBCE":      (MatchingModel_MLPGATv2SinkhornWBCE, "ws_room_dropout_noise_inc"),
+}
 
 
 def load_pgm_model():
+    if MODEL not in _MODEL_CONFIGS:
+        raise ValueError(f"Unknown MODEL '{MODEL}'. Choose from: {list(_MODEL_CONFIGS.keys())}")
 
+    model_class, data_subfolder = _MODEL_CONFIGS[MODEL]
 
-    # Set device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"PGM using device: {device}")
+    print(f"PGM using device: {device}, model: {MODEL}")
 
-
-    # Needed paths for initialization of the PGM model
     GNN_PATH = '/root/workspace/src/graph_matching_gnn/GNN'
+    model_save_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", MODEL)
+    data_paths = {
+        "equal":   os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
+        "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", data_subfolder),
+    }
 
-    NEW_MODEL = True
-    
-    if NEW_MODEL:
-        model_save_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise_inc_BCE")
-        data_paths = {
-            "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
-            "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise_inc")
-        }
-    else:
-        model_save_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise")
-        data_paths = {
-            "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
-            "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
-        }
-
-
-    # Initialize PGM model
     pgm_model = PartialGraphMatching(
-            model_class = MatchingModel_GATv2SinkhornTopK,
-            data_paths=data_paths,
-            model_save_path=model_save_path,
-            device=device,
-            in_dim=7,
-        )
+        model_class=model_class,
+        data_paths=data_paths,
+        model_save_path=model_save_path,
+        device=device,
+        in_dim=7,
+    )
     pgm_model.load_best_model()
-    print("PGM model initialized.")
-
+    print(f"PGM model initialized: {MODEL}")
 
     return pgm_model
 
@@ -68,20 +74,20 @@ def run_pgm_inference(graph1, graph2, output_path):
     """Run PGM inference on two graphs and save the matching matrix."""
     """ Args:
             graph1: Path to pickled NetworkX graph 1
-            graph2: Path to pickled NetworkX graph 2 
+            graph2: Path to pickled NetworkX graph 2
             output_path: Path where to save the matching matrix for the two graphs
         """
     try:
         # Load graphs
         with open(graph1, 'rb') as f:
             g1 = pickle.load(f)
-        with open(graph2, 'rb') as f:   
-            g2 = pickle.load(f) 
+        with open(graph2, 'rb') as f:
+            g2 = pickle.load(f)
 
 
         print(f"Graph 1: {g1.number_of_nodes()} nodes, {g1.number_of_edges()} edges")
-        print(f"Graph 2: {g2.number_of_nodes()} nodes, {g2.number_of_edges()} edges")        
-        
+        print(f"Graph 2: {g2.number_of_nodes()} nodes, {g2.number_of_edges()} edges")
+
         # Load PGM model
         pgm_model = load_pgm_model()
 
@@ -103,10 +109,10 @@ def run_pgm_inference(graph1, graph2, output_path):
         with open(output_path, 'wb') as f:
             pickle.dump(result, f)
         print(f"Matching matrix saved to {output_path}")
-        
+
         print("Inference completed successfully")
         return 0
-        
+
     except Exception as e:
         print(f"ERROR: {e}")
         import traceback
