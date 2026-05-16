@@ -96,7 +96,7 @@ tensorboard-data-server==0.7.2
 threadpoolctl==3.5.0
 torch==2.2.2
 torch-geometric==2.6.1
-tornado==6.4.2
+tornado==6.5
 tqdm==4.67.1
 traitlets==5.14.3
 typing_extensions==4.13.2
