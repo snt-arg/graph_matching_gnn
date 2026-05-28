@@ -1368,7 +1368,7 @@ def nx_to_pyg_data_preserve_order(graph: nx.DiGraph) -> Data:
         torch.tensor(
             node_type_mapping[graph.nodes[n]['type']] +
             graph.nodes[n]['center'] +
-            graph.nodes[n]['normal'] +
+            graph.nodes[n].get('normal', [0.0, 0.0]) +
             [graph.nodes[n].get('length', -1)],
             dtype=torch.float32
         )
