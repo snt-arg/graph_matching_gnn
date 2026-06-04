@@ -1998,7 +1998,8 @@ class PartialGraphMatching:
         heads = None,
         sinkhorn_max_iter = None,
         sinkhorn_tau = None,
-        seed=42
+        seed=42,
+        inference_only=False,
     ):
         self.device = device
         self.model_save_path = model_save_path
@@ -2052,7 +2053,8 @@ class PartialGraphMatching:
 
         # Load data
         self._load_data_raw(data_paths)
-        self._load_data_preprocessed(data_paths)
+        if not inference_only:
+            self._load_data_preprocessed(data_paths)
 
 
         # Training params
@@ -2061,6 +2063,18 @@ class PartialGraphMatching:
 
 
     def _load_data_raw(self, paths):
+        # Fast path: load pre-computed normalisation stats from the model folder
+        # so the dashboard doesn't have to deserialise ~30 k graph pairs on every
+        # startup. The cache is written the first time this method runs the full
+        # load, then reused on every subsequent call.
+        stats_cache = os.path.join(self.model_save_path, 'norm_stats.pt')
+        if os.path.exists(stats_cache):
+            stats = torch.load(stats_cache, map_location='cpu')
+            self.mean = stats['mean']
+            self.std = stats['std']
+            print(f"[INFO] Loaded normalisation stats from cache: {stats_cache}")
+            return
+
         self.original_graphs = deserialize_graph_matching_dataset(paths["equal"], "original.pkl")
         self.noise_graphs = deserialize_graph_matching_dataset(paths["partial"], "noise.pkl")
         # # graph matching-equal path
@@ -2080,9 +2094,13 @@ class PartialGraphMatching:
 
         # compute mean and std
         mean, std = compute_mean_std(train)
-        
+
         self.mean = mean
         self.std = std
+
+        # Persist for fast reuse
+        torch.save({'mean': mean, 'std': std}, stats_cache)
+        print(f"[INFO] Saved normalisation stats cache: {stats_cache}")
 
 
     
