@@ -16,14 +16,12 @@ import subprocess
 import sys
 
 # Install required packages
-subprocess.check_call([sys.executable, "-m", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas",
-                        "shapely", "seaborn", "pygmtools", "numpy", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
-
+subprocess.check_call(["uv", "pip", "install", "torch", "torch-geometric", "scikit-learn", "pandas", "shapely", "seaborn", "pygmtools", "numpy<2", "moviepy<2.0.0", "matplotlib", "tensorboard", "optuna", "plotly", "kaleido"])
 # Check if pygmtools is installed
 try:
     import pygmtools
 except ImportError:#pygmtools library
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"])
+    subprocess.check_call(["uv", "pip", "install", "git+https://github.com/Thinklab-SJTU/pygmtools.git"])
 
 # Check pytorch version and make sure you use a GPU Kernel
 import torch
@@ -177,6 +175,19 @@ def deserialize_MSD_dataset(data_path, original_path=None, noise_path=None, dime
             noise.append(graph)
 
     return original, noise, dimensions
+
+
+def _extended_or_flat(base_dir) -> str:
+    """
+    Return the sub-directory of `base_dir` that holds the `.pt` graphs, as an
+    `original_path` for deserialize_MSD_dataset:
+      - "extended"  for the new nested layout (base_dir/extended/*.pt)
+      - "."         for the legacy flat layout (base_dir/*.pt)
+    """
+    ext = os.path.join(str(base_dir), "extended")
+    if os.path.isdir(ext) and any(fn.endswith(".pt") for fn in os.listdir(ext)):
+        return "extended"
+    return "."
 
 def serialize_graph_matching_dataset(pairs: List[Tuple[Data, Data, torch.Tensor]], path: str, filename: str = "train_dataset.pkl"):
     """
@@ -386,16 +397,29 @@ def nx_to_pyg_data_preserve_order(graph: nx.DiGraph) -> Data:
     node_ids = list(graph.nodes())
     id_map = {nid: i for i, nid in enumerate(node_ids)}
 
-    x = torch.stack([
-        torch.tensor(
-            node_type_mapping[graph.nodes[n]['type']] +
-            graph.nodes[n]['center'] +
-            graph.nodes[n]['normal'] +
-            [graph.nodes[n].get('length', -1)],
-            dtype=torch.float32
-        )
-        for n in node_ids
-    ])
+    # Fixed-length feature per node: [type(2), center(2), normal(2), length(1)] = 7.
+    # center/normal are coerced to exactly 2 float values via numpy (take the first two
+    # coords, pad with 0). This is robust to the attribute being a Python list OR a numpy
+    # array (a bare `+` on a list and an ndarray does element-wise ADD, not concatenation,
+    # silently collapsing the feature to length 2) and to stray 3D/missing coords. Matches
+    # the real-graph loader (_real_nx_to_pyg) in the training script.
+    feats = []
+    for n in node_ids:
+        d = graph.nodes[n]
+        t = d.get('type')
+        if t not in node_type_mapping:
+            raise ValueError(
+                f"[{graph.graph.get('name')}] node {n!r} has unknown/missing type {t!r} "
+                f"(expected one of {list(node_type_mapping)})"
+            )
+        center = list(np.asarray(d.get('center', [0.0, 0.0]), dtype=float).ravel())[:2]
+        center = center + [0.0] * (2 - len(center))
+        normal = list(np.asarray(d.get('normal', [0.0, 0.0]), dtype=float).ravel())[:2]
+        normal = normal + [0.0] * (2 - len(normal))
+        length = float(d.get('length', -1))
+        feats.append(torch.tensor(node_type_mapping[t] + center + normal + [length],
+                                  dtype=torch.float32))
+    x = torch.stack(feats)
 
     edge_index = torch.tensor(
         [[id_map[u], id_map[v]] for u, v in graph.edges()],
@@ -472,13 +496,91 @@ def split_graphs_stratified(
 
 # Controllo rapido delle distribuzioni
 def describe(split, name):
+    if not split:
+        print(f"{name}: EMPTY (0 pairs)")
+        return
     sz = [g1.num_nodes for g1, _, _ in split]
     print(f"{name}: count={len(split)}, nodes min={min(sz)}, max={max(sz)}, mean={np.mean(sz):.1f}")
+
+
+def split_pairs_by_apartment(
+    pair_gt_list: List[Tuple[Data, Data, torch.Tensor]],
+    original_graphs: List[nx.DiGraph],
+    train_frac: float = 0.7,
+    val_frac: float   = 0.15,
+    test_frac: float  = 0.15,
+    n_bins: int       = 5,
+    seed: int         = seed,
+) -> Tuple[
+    List[Tuple[Data, Data, torch.Tensor]],
+    List[Tuple[Data, Data, torch.Tensor]],
+    List[Tuple[Data, Data, torch.Tensor]],
+]:
+    """
+    Group-based (apartment-level) split that avoids leakage across noise levels.
+
+    Each pair in `pair_gt_list` shares its reference graph g1 with all the noise-level
+    variants of the same apartment; g1.name is the apartment identity. We first split
+    the *original* apartments (stratified on the full original graph size), then route
+    every noise-level pair to the split of its apartment, so all variants of an
+    apartment (and its identical g1) stay in the same split.
+
+    Returns (train, val, test) lists of pairs, identical in structure to
+    `split_graphs_stratified`.
+    """
+    # 1) one representative pair per original apartment (g1 == g2 == original),
+    #    used only to reuse the stratified split logic on the full apartment size.
+    rep_pairs: List[Tuple[Data, Data, torch.Tensor]] = []
+    for g1 in original_graphs:
+        generate_matching_pair_as_data(g1, g1, rep_pairs)
+
+    # Stratifying on N apartments (not 9*N pairs) can leave a size-bin with <2 members
+    # in the val/test sub-split; fall back to a random apartment split if so.
+    try:
+        train_rep, val_rep, test_rep = split_graphs_stratified(
+            rep_pairs,
+            train_frac=train_frac, val_frac=val_frac, test_frac=test_frac,
+            n_bins=n_bins, seed=seed, stratify_on="g1",
+        )
+    except ValueError as e:
+        print(f"[apartment split] stratification failed ({e}); using random apartment split.")
+        train_rep, val_rep, test_rep = split_graphs_stratified(
+            rep_pairs,
+            train_frac=train_frac, val_frac=val_frac, test_frac=test_frac,
+            n_bins=1, seed=seed, stratify_on="g1",
+        )
+
+    train_names = {p[0].name for p in train_rep}
+    val_names   = {p[0].name for p in val_rep}
+    test_names  = {p[0].name for p in test_rep}
+
+    # sanity: apartments must not leak across splits
+    assert train_names.isdisjoint(val_names), "apartment leak train/val"
+    assert train_names.isdisjoint(test_names), "apartment leak train/test"
+    assert val_names.isdisjoint(test_names), "apartment leak val/test"
+
+    # 2) route every noise-level pair by its apartment (g1.name)
+    train, val, test = [], [], []
+    for pair in pair_gt_list:
+        name = pair[0].name
+        if name in train_names:
+            train.append(pair)
+        elif name in val_names:
+            val.append(pair)
+        elif name in test_names:
+            test.append(pair)
+        else:
+            raise ValueError(f"Apartment '{name}' not assigned to any split")
+
+    print(f"[apartment split] {len(train_names)}/{len(val_names)}/{len(test_names)} apartments "
+          f"-> {len(train)}/{len(val)}/{len(test)} pairs (train/val/test)")
+    return train, val, test
 
 def generate_matching_pair_as_data(
     g1: nx.DiGraph,
     g2: nx.DiGraph,
-    pairs_list: List[Tuple[Data, Data, torch.Tensor]]
+    pairs_list: List[Tuple[Data, Data, torch.Tensor]],
+    noise_level: int = None
 ) -> None:
     """
     Generate a matching pair for partial graph matching:
@@ -511,6 +613,8 @@ def generate_matching_pair_as_data(
     pyg_g2 = nx_to_pyg_data_preserve_order(g2_perm)
     pyg_g2.permutation = perm_indices
     pyg_g2.node_names = orig_names
+    if noise_level is not None:
+        pyg_g2.noise_level = noise_level
 
     # Build partial assignment ground truth P [|g1| x |g2|]
     P = torch.zeros((num_g1, num_g2), dtype=torch.float32)
@@ -715,6 +819,76 @@ def compute_mean_std(pairs: List[Tuple[Data, Data, torch.Tensor]]) -> Tuple[torc
     mean = x_all.mean(dim=0)
     std = x_all.std(dim=0)
     return mean, std
+
+
+def serialize_norm_stats(mean: torch.Tensor, std: torch.Tensor, path: str,
+                         filename: str = "norm_stats.pt") -> None:
+    """
+    Persist the per-feature normalization statistics used for a dataset so that any
+    downstream data (e.g. the real validation set) can be normalized identically.
+    """
+    os.makedirs(path, exist_ok=True)
+    full_path = os.path.join(path, filename)
+    torch.save({"mean": mean, "std": std}, full_path)
+    print(f"Saved normalization stats to {full_path}")
+
+
+def deserialize_norm_stats(path: str, filename: str = "norm_stats.pt"):
+    """
+    Load per-feature (mean, std) saved by serialize_norm_stats. Returns None if the
+    file is missing (older datasets), so callers can warn instead of crashing.
+    """
+    full_path = os.path.join(path, filename)
+    if not os.path.exists(full_path):
+        return None
+    stats = torch.load(full_path)
+    return stats["mean"], stats["std"]
+
+
+def check_pair_integrity(g1: Data, g2: Data, P: torch.Tensor, idx: int, name: str) -> None:
+    """
+    Hard-fail sanity check on a single (g1, g2, P) matching pair. Raises AssertionError
+    with the offending pair index and stats if anything is inconsistent.
+    """
+    ctx = f"[{name}] pair {idx}"
+    assert P.shape == (g1.num_nodes, g2.num_nodes), \
+        f"{ctx}: P shape {tuple(P.shape)} != ({g1.num_nodes}, {g2.num_nodes})"
+
+    uniq = torch.unique(P)
+    assert torch.isin(uniq, torch.tensor([0.0, 1.0], dtype=P.dtype)).all(), \
+        f"{ctx}: P is not binary, unique values = {uniq.tolist()}"
+
+    col_max = P.sum(dim=0).max().item() if P.numel() else 0.0
+    row_max = P.sum(dim=1).max().item() if P.numel() else 0.0
+    assert col_max <= 1.0, f"{ctx}: a g2 node is matched to >1 g1 node (max col sum {col_max})"
+    assert row_max <= 1.0, f"{ctx}: a g1 node is matched to >1 g2 node (max row sum {row_max})"
+
+    n_pos = int(P.sum().item())
+    assert n_pos > 0, f"{ctx}: P has no positive matches (degenerate pair)"
+
+    # Alignment: positives must equal the number of node ids shared by g1 and g2.
+    # A wrong reference<->noise pairing (round-robin) makes this mismatch, catching it.
+    shared = len(set(g1.node_names) & set(g2.node_names))
+    assert n_pos == shared, \
+        f"{ctx}: positives ({n_pos}) != shared node ids ({shared}) -> reference/noise misalignment"
+
+    assert torch.isfinite(g1.x).all(), f"{ctx}: g1 features contain NaN/Inf"
+    assert torch.isfinite(g2.x).all(), f"{ctx}: g2 features contain NaN/Inf"
+
+
+def check_pairs_integrity(pairs: List[Tuple[Data, Data, torch.Tensor]], name: str) -> None:
+    """
+    Run check_pair_integrity over a whole dataset before splitting/normalizing.
+    Aborts generation (AssertionError) on the first bad pair; prints a short summary
+    with the positives-per-pair distribution when everything is consistent.
+    """
+    positives = []
+    for i, (g1, g2, P) in enumerate(pairs):
+        check_pair_integrity(g1, g2, P, i, name)
+        positives.append(int(P.sum().item()))
+    if positives:
+        print(f"[{name}] integrity OK: {len(pairs)} pairs | positives/pair "
+              f"min={min(positives)} max={max(positives)} mean={np.mean(positives):.1f}")
 
 
 # %% [markdown]
@@ -1911,6 +2085,8 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
 # ├── models
 # │   ├── graph matching
 # │   │   ├── equal
+# │   │   ├── adj
+# │   │   ├── fully
 # │   │   ├── global
 # │   │   ├── global_local
 # │   │   └── local
@@ -1920,10 +2096,20 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
 # │       ├── room_dropout_noise
 # │       ├── ws_dropout_noise
 # │       │── ws_room_dropout_noise
-# │       └── ws_room_dropout_noise_inc
+# │       │── ws_room_dropout_noise_inc
+# │       │── adj_no_glob_65
+# │       │── adj_no_glob_95
+# │       │── adj_glob_65
+# │       │── adj_glob_95
+# │       │── fully_no_glob_65
+# │       │── fully_no_glob_95
+# │       │── fully_glob_65
+# │       └── fully_glob_95
 # ├── preprocessed
 # │   ├── graph matching
 # │   │   ├── equal
+# │   │   ├── adj
+# │   │   ├── fully
 # │   │   ├── global
 # │   │   ├── global_local
 # │   │   └── local
@@ -1933,10 +2119,20 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
 # │       ├── room_dropout_noise
 # │       ├── ws_dropout_noise
 # │       │── ws_room_dropout_noise
-# │       └── ws_room_dropout_noise_inc
+# │       │── ws_room_dropout_noise_inc
+# │       │── adj_no_glob_65
+# │       │── adj_no_glob_95
+# │       │── adj_glob_65
+# │       │── adj_glob_95
+# │       │── fully_no_glob_65
+# │       │── fully_no_glob_95
+# │       │── fully_glob_65
+# │       └── fully_glob_95
 # └── raw
 #     ├── graph matching
 #     │   ├── equal
+#     │   ├── adj
+#     │   ├── fully
 #     │   ├── global
 #     │   ├── global_local
 #     │   └── local
@@ -1946,11 +2142,22 @@ def visualize_initial_embeddings(h1, h2, output_path, node_type_filter: Optional
 #         ├── room_dropout_noise
 #         ├── ws_dropout_noise
 #         │── ws_room_dropout_noise
-#         └── ws_room_dropout_noise_inc
+#         │── ws_room_dropout_noise_inc
+#         │── adj_no_glob_65
+#         │── adj_no_glob_95
+#         │── adj_glob_65
+#         │── adj_glob_95
+#         │── fully_no_glob_65
+#         │── fully_no_glob_95
+#         │── fully_glob_65
+#         └── fully_glob_95
 
 def create_dir_structure(base_dir="GNN"):
-    categories = [
+    # Categories present under models / preprocessed / raw alike.
+    common = [
         "graph_matching/equal",
+        "graph_matching/adj",
+        "graph_matching/fully",
         "graph_matching/global",
         "graph_matching/global_local",
         "graph_matching/local",
@@ -1959,15 +2166,22 @@ def create_dir_structure(base_dir="GNN"):
         "partial_graph_matching/room_dropout_noise",
         "partial_graph_matching/ws_dropout_noise",
         "partial_graph_matching/ws_room_dropout_noise",
-        "partial_graph_matching/ws_room_dropout_noise_inc"
+        "partial_graph_matching/ws_room_dropout_noise_inc",
     ]
 
-    levels = ["models", "preprocessed", "raw"]
+    # adj/fully incremental variants: the raw noise graphs live in ONE shared folder per
+    # base (no _65/_95). The _65/_95 distinction only selects the noise-level subset and
+    # names the output. So raw gets the 4 shared folders, while models/preprocessed get
+    # the 8 suffixed output folders.
+    inc_bases = ["adj_no_glob", "adj_glob", "fully_no_glob", "fully_glob"]
+    inc_raw = [f"partial_graph_matching/{b}" for b in inc_bases]
+    inc_output = [f"partial_graph_matching/{b}_{s}" for b in inc_bases for s in ("65", "95")]
 
-    for level in levels:
-        for category in categories:
-            path = os.path.join(base_dir, level, category)
-            os.makedirs(path, exist_ok=True)
+    for level in ("models", "preprocessed"):
+        for category in common + inc_output:
+            os.makedirs(os.path.join(base_dir, level, category), exist_ok=True)
+    for category in common + inc_raw:
+        os.makedirs(os.path.join(base_dir, "raw", category), exist_ok=True)
 
 if __name__ == "__main__":
     create_dir_structure(GNN_PATH)
@@ -1979,857 +2193,1134 @@ if __name__ == "__main__":
 # %% [markdown]
 # ### GM Equal
 
-# %%
-# graph matching-equal path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# # %%
+# # graph matching-equal path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
 
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(original_graphs)}")
-print(original_graphs[0])
-print(original_graphs[0].nodes(data=True))
-print(original_graphs[0].edges(data=True))
-plot_a_graph([original_graphs[0]], path=os.path.join(gm_path, "equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(original_graphs)}")
+# print(original_graphs[0])
+# print(original_graphs[0].nodes(data=True))
+# print(original_graphs[0].edges(data=True))
+# plot_a_graph([original_graphs[0]], path=os.path.join(gm_path, "equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
 
-# %% [markdown]
-# #### Generate G1,G2,GT dataset
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
 
-# %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, g1, pair_gt_list)
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, g1, pair_gt_list)
 
-train, val, test = split_graphs_stratified(pair_gt_list)
+# train, val, test = split_graphs_stratified(pair_gt_list)
 
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
 
-# compute mean and std
-mean, std = compute_mean_std(train)
+# # compute mean and std
+# mean, std = compute_mean_std(train)
 
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
 
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    original_graphs,
-    gm_equal_preprocessed_path,
-    "original.pkl"
-)
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     original_graphs,
+#     gm_equal_preprocessed_path,
+#     "original.pkl"
+# )
 
-# Visualize the two graphs
-g1_out, g2_perm, gt_perm = train[0]
+# # Visualize the two graphs
+# g1_out, g2_perm, gt_perm = train[0]
 
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
 
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
-
-# %% [markdown]
-# ### GM Local Noise
-
-# %%
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="local")
-
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(noise_graphs)}")
-print(noise_graphs[0])
-print(noise_graphs[0].nodes(data=True))
-print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "local", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
 
 # %% [markdown]
-# #### Generate G1,G2,GT dataset
+# ### GM Adj / Fully  (same procedure as GM Equal)
 
 # %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
-
-train, val, test = split_graphs_stratified(pair_gt_list)
-
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
-
-# compute mean and std
-mean, std = compute_mean_std(train)
-
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
-
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "local")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
-
-# Visualize the two graphs
-g1_out, g2_perm, gt_perm = train[0]
-
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
-
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
-
-# %% [markdown]
-# ### GM Global Noise
-
-# %%
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="global")
-
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(noise_graphs)}")
-print(noise_graphs[0])
-print(noise_graphs[0].nodes(data=True))
-print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "global", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-
-# %% [markdown]
-# #### Generate G1,G2,GT dataset
-
-# %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
-
-train, val, test = split_graphs_stratified(pair_gt_list)
-
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
-
-# compute mean and std
-mean, std = compute_mean_std(train)
-
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
-
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "global")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
-
-# Visualize the two graphs
-g1_out, g2_perm, gt_perm = train[0]
-
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
-
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
-
-# %% [markdown]
-# ### GM Global + Local Noise
-
-# %%
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="global_local")
-
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(noise_graphs)}")
-print(noise_graphs[0])
-print(noise_graphs[0].nodes(data=True))
-print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "global_local", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-
-# %% [markdown]
-# #### Generate G1,G2,GT dataset
-
-# %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
-
-train, val, test = split_graphs_stratified(pair_gt_list)
-
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
-
-# compute mean and std
-mean, std = compute_mean_std(train)
-
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
-
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "global_local")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
-
-# Visualize the two graphs
-g1_out, g2_perm, gt_perm = train[0]
-
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
-
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
-
-# %% [markdown]
-# ## Partial Graph Matching dataset 
-
-# %% [markdown]
-# ### WS dropout equal
-
-# %%
-# graph matching-equal path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_dropout_equal")
-
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(noise_graphs)}")
-print(noise_graphs[0])
-print(noise_graphs[0].nodes(data=True))
-print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "ws_dropout_equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-
-# %% [markdown]
-# #### Generate G1,G2,GT dataset
-
-# %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
-
-train, val, test = split_graphs_stratified(pair_gt_list)
-
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
-
-# compute mean and std
-mean, std = compute_mean_std(train)
-
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
-
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout_equal")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
-
-g1_out, g2_perm, gt_perm = train[0]
-
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
-
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
-
-# %% [markdown]
-# ### WS dropout noise
-
-# %%
-# graph matching-equal path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_dropout_noise")
-
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(noise_graphs)}")
-print(noise_graphs[0])
-print(noise_graphs[0].nodes(data=True))
-print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[9]],path=os.path.join(gm_path, "ws_dropout_noise", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-
-# %% [markdown]
-# #### Generate G1,G2,GT dataset
-
-# %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
-
-train, val, test = split_graphs_stratified(pair_gt_list)
-
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
-
-# compute mean and std
-mean, std = compute_mean_std(train)
-
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
-
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout_noise")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
-
-g1_out, g2_perm, gt_perm = train[5]
-
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
-
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
-
-# %% [markdown]
-# ### Room dropout equal
-
-# %%
-# graph matching-equal path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="room_dropout_equal")
-
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(noise_graphs)}")
-print(noise_graphs[0])
-print(noise_graphs[0].nodes(data=True))
-print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "room_dropout_equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-
-# %% [markdown]
-# #### Generate G1,G2,GT dataset
-
-# %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
-
-train, val, test = split_graphs_stratified(pair_gt_list)
-
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
-
-# compute mean and std
-mean, std = compute_mean_std(train)
-
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
-
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_equal")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
-
-g1_out, g2_perm, gt_perm = train[0]
-
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
-
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
-
-# %% [markdown]
-# ### Room dropout noise
-
-# %%
-# graph matching-equal path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="room_dropout_noise")
-
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(noise_graphs)}")
-print(noise_graphs[0])
-print(noise_graphs[0].nodes(data=True))
-print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "room_dropout_noise", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-
-# %% [markdown]
-# #### Generate G1,G2,GT dataset
-
-# %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
-
-train, val, test = split_graphs_stratified(pair_gt_list)
-
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
-
-# compute mean and std
-mean, std = compute_mean_std(train)
-
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
-
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_noise")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
-
-g1_out, g2_perm, gt_perm = train[0]
-
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
-
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
-
-# %% [markdown]
-# ### Ws room dropout noise
-
-# %%
-# graph matching-equal path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
-noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_room_dropout_noise")
-
-# %%
-# Check the number of graphs
-print(f"Number of original graphs: {len(noise_graphs)}")
-print(noise_graphs[0])
-print(noise_graphs[0].nodes(data=True))
-print(noise_graphs[0].edges(data=True))
-plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "ws_room_dropout_noise", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-
-# %% [markdown]
-# #### Generate G1,G2,GT dataset
-
-# %%
-pair_gt_list = []
-for i, g1 in enumerate(original_graphs):
-    generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
-
-train, val, test = split_graphs_stratified(pair_gt_list)
-
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
-
-# compute mean and std
-mean, std = compute_mean_std(train)
-
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
-
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
-
-g1_out, g2_perm, gt_perm = train[0]
-
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
-
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
+def generate_gm_self_dataset(variant: str):
+    """
+    Build a graph-matching dataset for a connectivity variant ('equal', 'adj', 'fully', ...)
+    exactly like the 'equal' block: load the raw graphs, pair each graph with itself,
+    stratified train/val/test split, per-feature normalization (with the train mean/std),
+    then serialize train/valid/test/original into preprocessed/graph_matching/<variant>
+    and save the sample plots. The connectivity is already baked into the raw graphs,
+    so only the source/destination folder changes with respect to 'equal'.
+    """
+    raw_gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+    variant_dir = os.path.join(raw_gm_path, variant)
+    # graphs live in <variant>/extended/*.pt (new layout) or <variant>/*.pt (legacy flat)
+    graphs, _, _ = deserialize_MSD_dataset(data_path=variant_dir,
+                                           original_path=_extended_or_flat(variant_dir))
+    print(f"[{variant}] Number of original graphs: {len(graphs)}")
+
+    if not graphs:
+        print(f"[{variant}] raw folder '{os.path.join(raw_gm_path, variant)}' empty/missing "
+              f"-> skipping generation.")
+        return
+
+    plot_a_graph(
+        [graphs[0]],
+        path=os.path.join(raw_gm_path, variant, "apartment.png"),
+        viz_rooms=True, viz_ws=True, viz_openings=False,
+        viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True
+    )
+
+    # one self-pair per apartment (g1 == g2); each apartment appears exactly once, so a
+    # plain stratified split already keeps apartments disjoint across train/val/test.
+    pair_gt_list = []
+    for g1 in graphs:
+        generate_matching_pair_as_data(g1, g1, pair_gt_list)
+
+    check_pairs_integrity(pair_gt_list, variant)
+
+    train, val, test = split_graphs_stratified(pair_gt_list)
+    describe(train, f"{variant} TRAIN")
+    describe(val,   f"{variant} VAL")
+    describe(test,  f"{variant} TEST")
+
+    mean, std = compute_mean_std(train)
+    train_norm = normalize_data_pairs(train, mean, std)
+    val_norm   = normalize_data_pairs(val,   mean, std)
+    test_norm  = normalize_data_pairs(test,  mean, std)
+
+    out_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", variant)
+    serialize_norm_stats(mean, std, out_path)
+    serialize_graph_matching_dataset(train_norm, out_path, "train_dataset.pkl")
+    serialize_graph_matching_dataset(val_norm,   out_path, "valid_dataset.pkl")
+    serialize_graph_matching_dataset(test_norm,  out_path, "test_dataset.pkl")
+    serialize_graph_matching_dataset(graphs,     out_path, "original.pkl")
+
+    # visualize a sample pair with its ground-truth matching
+    g1_out, g2_perm, gt_perm = train[0]
+    plot_two_graphs_with_matching(
+        [g1_out, g2_perm],
+        gt_perm=gt_perm,
+        pred_perm=gt_perm,
+        original_graphs=graphs,
+        viz_rooms=True, viz_ws=True,
+        match_display="all",
+        path=os.path.join(out_path, "gt.png")
+    )
+    return train_norm, val_norm, test_norm
+
+
+# Generate the adjacency-based and fully-connected variants (same procedure as 'equal').
+generate_gm_self_dataset("adj")
+generate_gm_self_dataset("fully")
+
+# # %% [markdown]
+# # ### GM Local Noise
+
+# # %%
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="local")
+
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(noise_graphs)}")
+# print(noise_graphs[0])
+# print(noise_graphs[0].nodes(data=True))
+# print(noise_graphs[0].edges(data=True))
+# plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "local", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+# train, val, test = split_graphs_stratified(pair_gt_list)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "local")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# # Visualize the two graphs
+# g1_out, g2_perm, gt_perm = train[0]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
+
+# # %% [markdown]
+# # ### GM Global Noise
+
+# # %%
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="global")
+
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(noise_graphs)}")
+# print(noise_graphs[0])
+# print(noise_graphs[0].nodes(data=True))
+# print(noise_graphs[0].edges(data=True))
+# plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "global", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+# train, val, test = split_graphs_stratified(pair_gt_list)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "global")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# # Visualize the two graphs
+# g1_out, g2_perm, gt_perm = train[0]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
+
+# # %% [markdown]
+# # ### GM Global + Local Noise
+
+# # %%
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="global_local")
+
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(noise_graphs)}")
+# print(noise_graphs[0])
+# print(noise_graphs[0].nodes(data=True))
+# print(noise_graphs[0].edges(data=True))
+# plot_a_graph([noise_graphs[0]], path=os.path.join(gm_path, "global_local", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+# train, val, test = split_graphs_stratified(pair_gt_list)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "graph_matching", "global_local")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# # Visualize the two graphs
+# g1_out, g2_perm, gt_perm = train[0]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
+
+# # %% [markdown]
+# # ## Partial Graph Matching dataset 
+
+# # %% [markdown]
+# # ### WS dropout equal
+
+# # %%
+# # graph matching-equal path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+# noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_dropout_equal")
+
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(noise_graphs)}")
+# print(noise_graphs[0])
+# print(noise_graphs[0].nodes(data=True))
+# print(noise_graphs[0].edges(data=True))
+# plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "ws_dropout_equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+# train, val, test = split_graphs_stratified(pair_gt_list)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout_equal")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# g1_out, g2_perm, gt_perm = train[0]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
+
+# # %% [markdown]
+# # ### WS dropout noise
+
+# # %%
+# # graph matching-equal path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+# noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_dropout_noise")
+
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(noise_graphs)}")
+# print(noise_graphs[0])
+# print(noise_graphs[0].nodes(data=True))
+# print(noise_graphs[0].edges(data=True))
+# plot_a_graph([noise_graphs[9]],path=os.path.join(gm_path, "ws_dropout_noise", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+# train, val, test = split_graphs_stratified(pair_gt_list)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_dropout_noise")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# g1_out, g2_perm, gt_perm = train[5]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
+
+# # %% [markdown]
+# # ### Room dropout equal
+
+# # %%
+# # graph matching-equal path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+# noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="room_dropout_equal")
+
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(noise_graphs)}")
+# print(noise_graphs[0])
+# print(noise_graphs[0].nodes(data=True))
+# print(noise_graphs[0].edges(data=True))
+# plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "room_dropout_equal", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+# train, val, test = split_graphs_stratified(pair_gt_list)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_equal")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# g1_out, g2_perm, gt_perm = train[0]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
+
+# # %% [markdown]
+# # ### Room dropout noise
+
+# # %%
+# # graph matching-equal path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+# noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="room_dropout_noise")
+
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(noise_graphs)}")
+# print(noise_graphs[0])
+# print(noise_graphs[0].nodes(data=True))
+# print(noise_graphs[0].edges(data=True))
+# plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "room_dropout_noise", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+# train, val, test = split_graphs_stratified(pair_gt_list)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "room_dropout_noise")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# g1_out, g2_perm, gt_perm = train[0]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
+
+# # %% [markdown]
+# # ### Ws room dropout noise
+
+# # %%
+# # graph matching-equal path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+# noise_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_room_dropout_noise")
+
+# # %%
+# # Check the number of graphs
+# print(f"Number of original graphs: {len(noise_graphs)}")
+# print(noise_graphs[0])
+# print(noise_graphs[0].nodes(data=True))
+# print(noise_graphs[0].edges(data=True))
+# plot_a_graph([noise_graphs[0]],path=os.path.join(gm_path, "ws_room_dropout_noise", "apartment.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+# for i, g1 in enumerate(original_graphs):
+#     generate_matching_pair_as_data(g1, noise_graphs[i], pair_gt_list)
+
+# train, val, test = split_graphs_stratified(pair_gt_list)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# g1_out, g2_perm, gt_perm = train[0]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
 
 # %% [markdown]
 # ### Ws room incremental dropout noise
 # 
 
-# %%
-# graph matching-equal path
-gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
-original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
-# graph matching path
-gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
-noise_graphs_15, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_room_dropout_noise_inc/15")
-noise_graphs_35, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_room_dropout_noise_inc/35")
-noise_graphs_55, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_room_dropout_noise_inc/55")
-noise_graphs_75, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_room_dropout_noise_inc/75")
-noise_graphs_95, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="ws_room_dropout_noise_inc/95")
+# # %%
+# # graph matching-equal path
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# # graph matching path
+# gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+# noise_levels = [15, 25, 35, 45, 55, 65, 75, 85, 95]
+# all_noise_graphs = []
+# for level in noise_levels:
+#     graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path=f"ws_room_dropout_noise_inc/{level}")
+#     all_noise_graphs.append(graphs)
 
-# %%
-# Check the number of graphs
-assert len(noise_graphs_15) == len(noise_graphs_35) == len(noise_graphs_55) == len(noise_graphs_75) == len(noise_graphs_95), "All noise graphs should have the same number of graphs"
-noise_graphs = noise_graphs_15 + noise_graphs_35 + noise_graphs_55 + noise_graphs_75 + noise_graphs_95
+# # %%
+# # Check the number of graphs
+# n_per_level = len(all_noise_graphs[0])
+# assert all(len(g) == n_per_level for g in all_noise_graphs), "All noise levels should have the same number of graphs"
+# noise_graphs = [g for level_graphs in all_noise_graphs for g in level_graphs]
 
-print(f"Number of original graphs: {len(noise_graphs)}")
+# print(f"Number of noise graphs total: {len(noise_graphs)} ({n_per_level} per level x {len(noise_levels)} levels)")
 
-plot_a_graph([noise_graphs_15[0]],path=os.path.join(gm_path, "ws_room_dropout_noise_inc", "apartment_15.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-plot_a_graph([noise_graphs_35[0]],path=os.path.join(gm_path, "ws_room_dropout_noise_inc", "apartment_35.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-plot_a_graph([noise_graphs_55[0]],path=os.path.join(gm_path, "ws_room_dropout_noise_inc", "apartment_55.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-plot_a_graph([noise_graphs_75[0]],path=os.path.join(gm_path, "ws_room_dropout_noise_inc", "apartment_75.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
-plot_a_graph([noise_graphs_95[0]],path=os.path.join(gm_path, "ws_room_dropout_noise_inc", "apartment_95.png"), viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True, viz_normals=False, viz_room_normals=True, viz_walls=True)
+# print("\n--- Average room count per noise level ---")
+# for level, level_graphs in zip(noise_levels, all_noise_graphs):
+#     avg_rooms = np.mean([
+#         sum(1 for _, d in g.nodes(data=True) if d['type'] == 'room')
+#         for g in level_graphs
+#     ])
+#     print(f"  Level {level:>3}%: {avg_rooms:.2f} avg rooms")
+# print("-------------------------------------------\n")
 
+# for level in noise_levels:
+#     plot_a_graph(
+#         [all_noise_graphs[noise_levels.index(level)][0]],
+#         path=os.path.join(gm_path, "ws_room_dropout_noise_inc", f"apartment_{level}.png"),
+#         viz_rooms=True, viz_ws=True, viz_openings=False, viz_room_connection=True,
+#         viz_normals=False, viz_room_normals=True, viz_walls=True
+#     )
+
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset
+
+# # %%
+# pair_gt_list = []
+
+# for level, level_graphs in zip(noise_levels, all_noise_graphs):
+#     for i, g2 in enumerate(tqdm(level_graphs, desc=f"Level {level}%", unit="graph", ncols=80)):
+#         generate_matching_pair_as_data(original_graphs[i % len(original_graphs)], g2, pair_gt_list, noise_level=level)
+
+# assert len(pair_gt_list) == n_per_level * len(noise_levels), "Pair GT list should contain len(noise_levels) times the number of noise graphs per level"
+
+# # Apartment-level split (no leakage across noise levels): split the original
+# # apartments once (stratified on full size), then route every noise variant accordingly.
+# train, val, test = split_pairs_by_apartment(pair_gt_list, original_graphs)
+
+# describe(train, "TRAIN")
+# describe(val,   "VAL")
+# describe(test,  "TEST")
+
+# # compute mean and std
+# mean, std = compute_mean_std(train)
+
+# # Normalizzazione dei set
+# train_pairs_norm = normalize_data_pairs(train, mean, std)
+# val_pairs_norm = normalize_data_pairs(val, mean, std)
+# test_pairs_norm = normalize_data_pairs(test, mean, std)
+
+# gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise_inc")
+# serialize_graph_matching_dataset(
+#     train_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "train_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     val_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "valid_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     test_pairs_norm,
+#     gm_equal_preprocessed_path,
+#     "test_dataset.pkl"
+# )
+# serialize_graph_matching_dataset(
+#     noise_graphs,
+#     gm_equal_preprocessed_path,
+#     "noise.pkl"
+# )
+
+# g1_out, g2_perm, gt_perm = train[0]
+
+# print(g1_out)
+# print("G1 nodes:", g1_out.x[0])
+# print(g2_perm)
+# print("G2 permuted nodes:", g2_perm.x[0])
+# print("Ground truth permutation:\n", gt_perm[0])
+
+# # %%
+# # Visualize the two graphs
+# plot_two_graphs_with_matching(
+#     [g1_out, g2_perm],
+#     gt_perm=gt_perm,
+#     pred_perm=gt_perm,
+#     original_graphs=original_graphs,
+#     noise_graphs=noise_graphs,
+#     viz_rooms=True,
+#     viz_ws=True,
+#     match_display="all",
+#     path=os.path.join(gm_equal_preprocessed_path, "gt.png")
+# )
+
+# # %% [markdown]
+# # ### Ws room incremental dropout noise (15-75)
+
+# # %%
+# gm_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+# original_graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path="equal")
+# gm_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+# noise_levels_75 = [15, 25, 35, 45, 55, 65, 75]
+# all_noise_graphs_75 = []
+# for level in noise_levels_75:
+#     graphs, _, _ = deserialize_MSD_dataset(data_path=gm_path, original_path=f"ws_room_dropout_noise_inc/{level}")
+#     all_noise_graphs_75.append(graphs)
+
+# n_per_level_75 = len(all_noise_graphs_75[0])
+# noise_graphs_75 = [g for level_graphs in all_noise_graphs_75 for g in level_graphs]
+
+# print(f"Number of noise graphs total: {len(noise_graphs_75)} ({n_per_level_75} per level x {len(noise_levels_75)} levels)")
+
+# # %% [markdown]
+# # #### Generate G1,G2,GT dataset (15-75)
+
+# # %%
+# pair_gt_list_75 = []
+# for level, level_graphs in zip(noise_levels_75, all_noise_graphs_75):
+#     for i, g2 in enumerate(tqdm(level_graphs, desc=f"Level {level}%", unit="graph", ncols=80)):
+#         generate_matching_pair_as_data(original_graphs[i % len(original_graphs)], g2, pair_gt_list_75, noise_level=level)
+
+# # Apartment-level split (no leakage across noise levels), same policy as the full dataset.
+# train_75, val_75, test_75 = split_pairs_by_apartment(pair_gt_list_75, original_graphs)
+
+# describe(train_75, "TRAIN")
+# describe(val_75,   "VAL")
+# describe(test_75,  "TEST")
+
+# mean_75, std_75 = compute_mean_std(train_75)
+# train_75_norm = normalize_data_pairs(train_75, mean_75, std_75)
+# val_75_norm   = normalize_data_pairs(val_75,   mean_75, std_75)
+# test_75_norm  = normalize_data_pairs(test_75,  mean_75, std_75)
+
+# gm_75_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise_inc_75")
+# serialize_graph_matching_dataset(train_75_norm,    gm_75_preprocessed_path, "train_dataset.pkl")
+# serialize_graph_matching_dataset(val_75_norm,      gm_75_preprocessed_path, "valid_dataset.pkl")
+# serialize_graph_matching_dataset(test_75_norm,     gm_75_preprocessed_path, "test_dataset.pkl")
+# serialize_graph_matching_dataset(noise_graphs_75,  gm_75_preprocessed_path, "noise.pkl")
 
 # %% [markdown]
-# #### Generate G1,G2,GT dataset
+# ### Adj / Fully incremental datasets
+#
+# Eight incremental `ws_room_dropout_noise_inc`-style datasets living under
+# `partial_graph_matching`. The 4 `adj_*` datasets share the reference graph (g1, the "equal")
+# stored in `raw/graph_matching/adj`; the 4 `fully_*` datasets share the one in
+# `raw/graph_matching/fully`. The `_65` / `_95` suffix selects the incremental noise-level range,
+# while `glob` / `no_glob` is already baked into the raw noise graphs (no code difference beyond
+# the raw folder read). A dataset is generated only if its raw folder is populated, i.e. every
+# expected `<level>` subfolder exists and contains at least one `.pt`; otherwise it is skipped.
 
 # %%
-pair_gt_list = []
+def _inc_raw_is_full(raw_dataset_dir, levels):
+    """
+    Return True only if every `<level>` folder holds at least one `.pt` — looking in the
+    `<level>/extended/` subfolder (new layout) or `<level>/` directly (legacy flat).
+    Missing/empty level folders -> False (dataset skipped).
+    """
+    raw_dataset_dir = Path(raw_dataset_dir)
+    for level in levels:
+        level_dir = raw_dataset_dir / str(level)
+        if not level_dir.is_dir():
+            return False
+        pt_dir = level_dir / "extended" if (level_dir / "extended").is_dir() else level_dir
+        if not any(pt_dir.glob("*.pt")):
+            return False
+    return True
 
-for i, g2 in enumerate(tqdm(noise_graphs, desc="Pair graph generation", unit="graph", ncols=80)):
-    generate_matching_pair_as_data(original_graphs[i % len(original_graphs)], g2, pair_gt_list)
 
-assert len(pair_gt_list) == len(noise_graphs_15) * 5, "Pair GT list should contain 5 times the number of noise graphs"
+def build_incremental_partial_dataset(name, raw_variant, reference_graphs, levels):
+    """
+    Build an incremental partial-matching dataset (same pipeline as `ws_room_dropout_noise_inc`).
 
-train, val, test = split_graphs_stratified(pair_gt_list)
+    Reads the per-level noise graphs from the SHARED raw folder
+    `raw/partial_graph_matching/<raw_variant>/<level>` (one folder serves both the _65 and _95
+    outputs; only `levels` differs), pairs each with the shared reference graph (round-robin),
+    splits by apartment (no leakage across noise levels), normalizes on the train split and
+    serializes `train/valid/test/noise.pkl` (plus a `gt.png` preview) into
+    `preprocessed/partial_graph_matching/<name>`.
+    """
+    raw_partial_path = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
 
-describe(train, "TRAIN")
-describe(val,   "VAL")
-describe(test,  "TEST")
+    all_noise_graphs = []
+    for level in levels:
+        level_dir = os.path.join(raw_partial_path, raw_variant, str(level))
+        graphs, _, _ = deserialize_MSD_dataset(data_path=level_dir,
+                                               original_path=_extended_or_flat(level_dir))
+        all_noise_graphs.append(graphs)
 
-# compute mean and std
-mean, std = compute_mean_std(train)
+    n_per_level = len(all_noise_graphs[0])
+    assert all(len(g) == n_per_level for g in all_noise_graphs), \
+        f"[{name}] all noise levels should have the same number of graphs"
+    noise_graphs = [g for level_graphs in all_noise_graphs for g in level_graphs]
+    print(f"[{name}] number of noise graphs total: {len(noise_graphs)} "
+          f"({n_per_level} per level x {len(levels)} levels)")
 
-# Normalizzazione dei set
-train_pairs_norm = normalize_data_pairs(train, mean, std)
-val_pairs_norm = normalize_data_pairs(val, mean, std)
-test_pairs_norm = normalize_data_pairs(test, mean, std)
+    # Generate (g1, g2_perm, P) pairs: reference is shared, so we cycle over it round-robin.
+    pair_gt_list = []
+    for level, level_graphs in zip(levels, all_noise_graphs):
+        for i, g2 in enumerate(tqdm(level_graphs, desc=f"[{name}] Level {level}%", unit="graph", ncols=80)):
+            generate_matching_pair_as_data(reference_graphs[i % len(reference_graphs)], g2, pair_gt_list, noise_level=level)
 
-gm_equal_preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise_inc")
-serialize_graph_matching_dataset(
-    train_pairs_norm,
-    gm_equal_preprocessed_path,
-    "train_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    val_pairs_norm,
-    gm_equal_preprocessed_path,
-    "valid_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    test_pairs_norm,
-    gm_equal_preprocessed_path,
-    "test_dataset.pkl"
-)
-serialize_graph_matching_dataset(
-    noise_graphs,
-    gm_equal_preprocessed_path,
-    "noise.pkl"
-)
+    assert len(pair_gt_list) == n_per_level * len(levels), \
+        f"[{name}] pair GT list should contain len(levels) times the noise graphs per level"
 
-g1_out, g2_perm, gt_perm = train[0]
+    # Integrity check: catches reference<->noise misalignment (empty/degenerate P) etc.
+    check_pairs_integrity(pair_gt_list, name)
 
-print(g1_out)
-print("G1 nodes:", g1_out.x[0])
-print(g2_perm)
-print("G2 permuted nodes:", g2_perm.x[0])
-print("Ground truth permutation:\n", gt_perm[0])
+    # Apartment-level split (no leakage across noise levels).
+    train, val, test = split_pairs_by_apartment(pair_gt_list, reference_graphs)
 
-# %%
-# Visualize the two graphs
-plot_two_graphs_with_matching(
-    [g1_out, g2_perm],
-    gt_perm=gt_perm,
-    pred_perm=gt_perm,
-    original_graphs=original_graphs,
-    noise_graphs=noise_graphs,
-    viz_rooms=True,
-    viz_ws=True,
-    match_display="all",
-    path=os.path.join(gm_equal_preprocessed_path, "gt.png")
-)
+    describe(train, f"[{name}] TRAIN")
+    describe(val,   f"[{name}] VAL")
+    describe(test,  f"[{name}] TEST")
+
+    # compute mean/std on train, normalize every split with it
+    mean, std = compute_mean_std(train)
+    train_pairs_norm = normalize_data_pairs(train, mean, std)
+    val_pairs_norm   = normalize_data_pairs(val, mean, std)
+    test_pairs_norm  = normalize_data_pairs(test, mean, std)
+
+    preprocessed_path = os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", name)
+    serialize_norm_stats(mean, std, preprocessed_path)
+    serialize_graph_matching_dataset(train_pairs_norm, preprocessed_path, "train_dataset.pkl")
+    serialize_graph_matching_dataset(val_pairs_norm,   preprocessed_path, "valid_dataset.pkl")
+    serialize_graph_matching_dataset(test_pairs_norm,  preprocessed_path, "test_dataset.pkl")
+    serialize_graph_matching_dataset(noise_graphs,     preprocessed_path, "noise.pkl")
+
+    # Preview the ground-truth matching of the first train pair.
+    g1_out, g2_perm, gt_perm = train[0]
+    plot_two_graphs_with_matching(
+        [g1_out, g2_perm],
+        gt_perm=gt_perm,
+        pred_perm=gt_perm,
+        original_graphs=reference_graphs,
+        noise_graphs=noise_graphs,
+        viz_rooms=True,
+        viz_ws=True,
+        match_display="all",
+        path=os.path.join(preprocessed_path, "gt.png")
+    )
+    print(f"[{name}] done.")
+
+
+# Config table: (output name, shared raw folder, reference under graph_matching, noise levels).
+# `_65` -> up to 65%, `_95` -> up to 95%: the two share ONE raw folder (`raw_variant`) and differ
+# only in the level subset. `adj_*` share graph_matching/adj as reference, `fully_*` graph_matching/fully.
+INCREMENTAL_DATASETS = [
+    ("adj_no_glob_65",   "adj_no_glob",   "adj",   [15, 25, 35, 45, 55, 65]),
+    ("adj_no_glob_95",   "adj_no_glob",   "adj",   [15, 25, 35, 45, 55, 65, 75, 85, 95]),
+    ("adj_glob_65",      "adj_glob",      "adj",   [15, 25, 35, 45, 55, 65]),
+    ("adj_glob_95",      "adj_glob",      "adj",   [15, 25, 35, 45, 55, 65, 75, 85, 95]),
+    ("fully_no_glob_65", "fully_no_glob", "fully", [15, 25, 35, 45, 55, 65]),
+    ("fully_no_glob_95", "fully_no_glob", "fully", [15, 25, 35, 45, 55, 65, 75, 85, 95]),
+    ("fully_glob_65",    "fully_glob",    "fully", [15, 25, 35, 45, 55, 65]),
+    ("fully_glob_95",    "fully_glob",    "fully", [15, 25, 35, 45, 55, 65, 75, 85, 95]),
+]
+
+# Lazily load & cache each shared reference ("equal") only when at least one of its datasets is full.
+_reference_cache = {}
+
+
+def _get_reference_graphs(reference_name):
+    if reference_name not in _reference_cache:
+        gm_raw_path = os.path.join(GNN_PATH, "raw", "graph_matching")
+        ref_dir = os.path.join(gm_raw_path, reference_name)
+        ref_graphs, _, _ = deserialize_MSD_dataset(data_path=ref_dir,
+                                                   original_path=_extended_or_flat(ref_dir))
+        _reference_cache[reference_name] = ref_graphs
+    return _reference_cache[reference_name]
+
+
+raw_partial_root = os.path.join(GNN_PATH, "raw", "partial_graph_matching")
+for name, raw_variant, reference_name, levels in INCREMENTAL_DATASETS:
+    raw_dataset_dir = os.path.join(raw_partial_root, raw_variant)
+    if not _inc_raw_is_full(raw_dataset_dir, levels):
+        print(f"[{name}] shared raw folder '{raw_variant}' empty/incomplete for levels {levels} "
+              f"-> skipping generation.")
+        continue
+    reference_graphs = _get_reference_graphs(reference_name)
+    build_incremental_partial_dataset(name, raw_variant, reference_graphs, levels)
