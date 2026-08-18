@@ -10,3 +10,6 @@ graph_matching/GNN.tar.bz2
 graph_matching/tb_logs
 graph_matching/AFAT/__pycache__/
 Colab Notebooks/
+old
+results/
+wandb/

@@ -1,22 +1,31 @@
 [project]
 name = "graph-matching-gnn"
 version = "0.1.0"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "kaleido>=1.2.0",
     "matplotlib>=3.10.8",
     "moviepy<2.0.0",
     "networkx>=3.6.1",
-    "numpy>=2.4.4",
+    "numpy==1.26.4",
     "optuna>=4.8.0",
-    "pandas>=3.0.2",
+    "pandas>=2.2,<3",
     "plotly>=6.7.0",
     "pygmtools>=0.6.0",
-    "scikit-learn>=1.8.0",
+    "scikit-learn>=1.7,<1.8",
     "seaborn>=0.13.2",
     "shapely>=2.1.2",
     "tensorboard>=2.20.0",
-    "torch>=2.11.0",
+    "torch==2.2.2+cu121",
     "torch-geometric>=2.7.0",
     "tqdm>=4.67.3",
+    "wandb>=0.28.0",
 ]
+
+[[tool.uv.index]]
+name = "pytorch-cu121"
+url = "https://download.pytorch.org/whl/cu121"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu121" }
