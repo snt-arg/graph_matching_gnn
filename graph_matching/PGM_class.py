@@ -16,12 +16,13 @@ if not os.path.exists(GNN_PATH):
 # ─── Standard library ──────────────────────────────────────────────────────────
 import copy
 import sys
+import argparse
 import pickle
 import random
 import time
 import math
 from pathlib import Path
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 from datetime import datetime
 
 # ─── Third-party libraries ─────────────────────────────────────────────────────
@@ -851,7 +852,7 @@ def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=Non
                                   viz_rooms=True, viz_ws=True,
                                   viz_room_connection=True,
                                   viz_normals=False, viz_room_normals=False,
-                                  match_display="all"):
+                                  match_display="all", title=None):
     assert match_display in {"all", "correct", "wrong"}, "match_display must be one of: 'all', 'correct', 'wrong'"
     assert len(graphs_list) == 2, "graphs_list must contain exactly two graphs."
     if noise_graphs is None:
@@ -954,7 +955,7 @@ def plot_two_graphs_with_matching(graphs_list, gt_perm=None, original_graphs=Non
             ax.plot([pt1[0], pt2[0]], [pt1[1], pt2[1]],
                     color=color, linestyle='-', alpha=0.6, linewidth=1, label=label)
 
-    ax.set_title("Graph Matching" + (": Green = Correct, Red = Wrong" if gt_perm is not None else ": Predicted matches"))
+    ax.set_title(title or ("Graph Matching" + (": Green = Correct, Red = Wrong" if gt_perm is not None else ": Predicted matches")))
     ax.axis("equal")
     ax.legend()
     plt.tight_layout()
@@ -1547,30 +1548,376 @@ class PartialGraphMatching:
         return matching_matrix
 
 
-# %% [markdown]
-# # Unit test
-# %%
-paths = {
-    "equal": os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
-    "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", "ws_room_dropout_noise")
-}
-exp = PartialGraphMatching(
-    model_class=MatchingModel_GATv2SinkhornTopK,
-    data_paths=paths,
-    model_save_path=os.path.join(GNN_PATH, 'models', "partial_graph_matching", "ws_room_dropout_noise"),
-    in_dim=in_dim,
-    device=device
-)
-# %%
-exp.load_best_model()
+# ═══════════════════════════════════════════════════════════════════════════
+#  CURRENT MODELS (adj / fully) — test + inference
+# ═══════════════════════════════════════════════════════════════════════════
+# Everything below targets the model actually trained by
+# pgm_training_ws_room_inc_WBCE_scratch.py (MLP + GATv2 + Sinkhorn + WBCE),
+# reading hyperparameters from best_trial_results.json, the best_val_model.pt
+# checkpoint and norm_stats.pt. Use the PGMTester class (single entry point).
 
-# %%
-# exp.train()
-exp.evaluate()
+def deserialize_norm_stats(path: str, filename: str = "norm_stats.pt"):
+    """Load per-feature (mean, std) saved by dataset_gen.py; None if missing."""
+    full_path = os.path.join(path, filename)
+    if not os.path.exists(full_path):
+        return None
+    stats = torch.load(full_path, map_location="cpu")
+    return stats["mean"], stats["std"]
 
-# %%
-exp.inference()
 
-# %%
-matching = exp.infer_matching(exp.original_graphs[1310], exp.noise_graphs[1310])
-print(matching)
+def hard_perm_from_scores(P: torch.Tensor) -> torch.Tensor:
+    """Convert a soft permutation matrix into a hard assignment (one per column)."""
+    hard = torch.zeros_like(P)
+    hard[P.argmax(dim=0), torch.arange(P.shape[1], device=P.device)] = 1
+    return hard
+
+
+def permutation_confusion_counts(P_pred_hard: torch.Tensor, P_gt: torch.Tensor) -> Tuple[int, int, int, int]:
+    """Return (tp, fp, fn, tn) counts comparing hard predictions to ground truth."""
+    pred = (P_pred_hard > 0.5).to(P_gt.dtype)
+    tp = (pred * P_gt).sum().item()
+    fp = (pred * (1 - P_gt)).sum().item()
+    fn = ((1 - pred) * P_gt).sum().item()
+    tn = ((1 - pred) * (1 - P_gt)).sum().item()
+    return tp, fp, fn, tn
+
+
+def permutation_precision_recall_f1(tp, fp, fn, eps: float = 1e-9) -> Tuple[float, float, float]:
+    precision = tp / (tp + fp + eps)
+    recall = tp / (tp + fn + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+    return precision, recall, f1
+
+
+def weighted_bce_loss(S_pred, S_gt):
+    """Weighted BCE permutation loss (matches the training objective)."""
+    num_pos = S_gt.sum()
+    num_neg = (1.0 - S_gt).sum()
+    pos_weight = (num_neg / num_pos) if num_pos > 0 else torch.tensor(1.0, device=S_pred.device)
+    bce_loss_map = F.binary_cross_entropy(S_pred, S_gt.float(), reduction="none")
+    weight_matrix = S_gt * pos_weight + (1.0 - S_gt) * 1.0
+    return (bce_loss_map * weight_matrix).mean()
+
+
+class MatchingModel_MLPGATv2SinkhornWBCE(nn.Module):
+    """Verbatim copy of the trained class (must match for state_dict loading)."""
+    def __init__(self, in_dim, hidden_dim, out_dim, sinkhorn_max_iter: int = 10, sinkhorn_tau: float = 1.0,
+                 attention_dropout: float = 0.1, dropout_emb: float = 0.1, num_layers: int = 2, heads: int = 1):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_emb),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(p=dropout_emb)
+        )
+        self.gnn = nn.ModuleList()
+        dims = [hidden_dim] * num_layers + [out_dim]
+        for i in range(num_layers):
+            self.gnn.append(
+                GATv2Conv(dims[i], dims[i + 1], heads=heads, concat=False, dropout=attention_dropout)
+            )
+        self.dropout = nn.Dropout(p=dropout_emb)
+        self.inst_norm = nn.InstanceNorm2d(1, affine=True)
+        self.sinkhorn_max_iter = sinkhorn_max_iter
+        self.sinkhorn_tau = sinkhorn_tau
+
+    def encode(self, x, edge_index):
+        for i, conv in enumerate(self.gnn):
+            x = conv(x, edge_index)
+            if i < len(self.gnn) - 1:
+                x = F.relu(x)
+                x = self.dropout(x)
+        return x
+
+    def forward(self, batch1, batch2, perm_list=None, batch_idx1=None, batch_idx2=None, inference=False):
+        dev = next(self.parameters()).device
+        x1, edge1 = batch1.x.to(dev), batch1.edge_index.to(dev)
+        x2, edge2 = batch2.x.to(dev), batch2.edge_index.to(dev)
+        batch_idx1 = batch1.batch.to(dev) if batch_idx1 is None else batch_idx1.to(dev)
+        batch_idx2 = batch2.batch.to(dev) if batch_idx2 is None else batch_idx2.to(dev)
+
+        h1 = self.encode(self.mlp(x1), edge1)
+        h2 = self.encode(self.mlp(x2), edge2)
+
+        B = batch_idx1.max().item() + 1
+        perm_pred_list, all_embeddings = [], []
+        for b in range(B):
+            h1_b = h1[batch_idx1 == b]
+            h2_b = h2[batch_idx2 == b]
+            N1, N2 = h1_b.size(0), h2_b.size(0)
+
+            sim = torch.matmul(h1_b, h2_b.T)
+            sim_normed = self.inst_norm(sim.unsqueeze(0).unsqueeze(1)).squeeze(1)
+
+            transposed = N1 > N2
+            if transposed:
+                sim_input = sim_normed.transpose(-2, -1)
+                nr = torch.tensor([N2], dtype=torch.long, device=dev)
+                nc = torch.tensor([N1], dtype=torch.long, device=dev)
+            else:
+                sim_input = sim_normed
+                nr = torch.tensor([N1], dtype=torch.long, device=dev)
+                nc = torch.tensor([N2], dtype=torch.long, device=dev)
+
+            S = pygmtools.sinkhorn(sim_input, n1=nr, n2=nc, dummy_row=(N1 != N2),
+                                   max_iter=self.sinkhorn_max_iter, tau=self.sinkhorn_tau)
+            if transposed:
+                S = S.transpose(-2, -1)
+            perm_pred_list.append(S.squeeze(0))
+            all_embeddings.append((h1_b, h2_b))
+        return perm_pred_list, all_embeddings
+
+
+class PGMTester:
+    """
+    Load a trained model for `experiment` (adj / fully / ...) and run test-set or
+    arbitrary-pair matching. Paths mirror the training script:
+
+      models_path       : GNN/models/partial_graph_matching/<experiment>
+      preprocessed_path : GNN/preprocessed/partial_graph_matching/<experiment>
+      reference_path    : GNN/preprocessed/graph_matching/<reference>
+      test images out   : <models_path>/test/
+    """
+
+    def __init__(self, experiment: str, gnn_path: str = GNN_PATH, device=device,
+                 reference: Optional[str] = None, checkpoint: str = "best", seed: int = 42):
+        set_seed(seed)
+        self.experiment = experiment
+        self.device = device
+        if reference is None:
+            reference = ("adj" if experiment.startswith("adj")
+                         else "fully" if experiment.startswith("fully")
+                         else "equal")
+        self.reference = reference
+
+        self.models_path = os.path.join(gnn_path, "models", "partial_graph_matching", experiment)
+        self.preprocessed_path = os.path.join(gnn_path, "preprocessed", "partial_graph_matching", experiment)
+        self.reference_path = os.path.join(gnn_path, "preprocessed", "graph_matching", reference)
+        self.test_out_dir = os.path.join(self.models_path, "test")
+        os.makedirs(self.test_out_dir, exist_ok=True)
+
+        print(f"Experiment: {experiment} | reference: {reference}")
+        print(f"  test images -> {self.test_out_dir}")
+
+        # preprocessed test set (already normalized) + raw graphs (for plotting geometry)
+        self.test_list = deserialize_graph_matching_dataset(self.preprocessed_path, "test_dataset.pkl")
+        self.original_graphs = deserialize_graph_matching_dataset(self.reference_path, "original.pkl")
+        self.noise_graphs = deserialize_graph_matching_dataset(self.preprocessed_path, "noise.pkl")
+
+        # normalization stats (for graphs NOT coming from train/val/test)
+        stats = deserialize_norm_stats(self.preprocessed_path)
+        if stats is None:
+            self.mean = self.std = None
+            print(f"  [WARNING] norm_stats.pt not found: infer_from_nx() will NOT normalize.")
+        else:
+            self.mean, self.std = stats
+
+        # hyperparameters + model + checkpoint
+        self.params = self._load_best_params()
+        self.in_dim = self.test_list[0][0].x.size(1)
+        self.model = self._build_model()
+        self._load_checkpoint(checkpoint)
+
+    # ---- setup -------------------------------------------------------------
+    def _load_best_params(self) -> dict:
+        json_path = os.path.join(self.models_path, "best_trial_results.json")
+        if os.path.exists(json_path):
+            with open(json_path) as f:
+                params = json.load(f)["params"]
+            print("  Loaded hyperparameters from best_trial_results.json")
+            return params
+        with open(os.path.join(self.models_path, "study.pkl"), "rb") as f:
+            study = pickle.load(f)
+        print("  Loaded hyperparameters from study.pkl (fallback)")
+        return study.best_trial.params
+
+    def _build_model(self) -> nn.Module:
+        p = self.params
+        return MatchingModel_MLPGATv2SinkhornWBCE(
+            in_dim=self.in_dim, hidden_dim=p["hidden_dim"], out_dim=p["out_dim"],
+            attention_dropout=p["attn_dropout"], dropout_emb=p["dropout_emb"],
+            num_layers=p["num_layers"], heads=p["heads"],
+            sinkhorn_max_iter=p["sinkhorn_max_iter"], sinkhorn_tau=p["sinkhorn_tau"],
+        ).to(self.device)
+
+    def _load_checkpoint(self, which: str):
+        fname = "best_val_model.pt" if which == "best" else "final_model.pt"
+        ckpt_path = os.path.join(self.models_path, fname)
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+        ckpt = torch.load(ckpt_path, map_location=self.device)
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.model.to(self.device).eval()
+        print(f"  Loaded {fname} (epoch {ckpt.get('epoch', '?')}, "
+              f"best_val_loss {ckpt.get('best_val_loss', float('nan')):.4f})")
+
+    def _predict(self, data1, data2, use_hungarian: bool = True) -> torch.Tensor:
+        """Return a hard match matrix [N1, N2] (Hungarian) or the soft Sinkhorn scores."""
+        self.model.eval()
+        dev = self.device
+        with torch.no_grad():
+            data1, data2 = data1.to(dev), data2.to(dev)
+            b1 = torch.zeros(data1.num_nodes, dtype=torch.long, device=dev)
+            b2 = torch.zeros(data2.num_nodes, dtype=torch.long, device=dev)
+            sim_list, _ = self.model(data1, data2, batch_idx1=b1, batch_idx2=b2, inference=True)
+            sim = sim_list[0].unsqueeze(0)
+            n1 = torch.tensor([sim.shape[1]], dtype=torch.int32, device=dev)
+            n2 = torch.tensor([sim.shape[2]], dtype=torch.int32, device=dev)
+            if use_hungarian:
+                return pygmtools.hungarian(sim, n1=n1, n2=n2).squeeze(0)
+            return sim.squeeze(0)
+
+    # ---- per-pair evaluation ----------------------------------------------
+    def _eval_pair(self, d1, d2, P_gt, use_hungarian: bool) -> Tuple[dict, dict, torch.Tensor]:
+        """Return (per-pair metrics, raw confusion counts, hard matrix for plotting)."""
+        dev = self.device
+        d1, d2, P_gt = d1.to(dev), d2.to(dev), P_gt.to(dev)
+        b1 = torch.zeros(d1.num_nodes, dtype=torch.long, device=dev)
+        b2 = torch.zeros(d2.num_nodes, dtype=torch.long, device=dev)
+        with torch.no_grad():
+            pred_list, _ = self.model(d1, d2, perm_list=None, batch_idx1=b1, batch_idx2=b2, inference=True)
+        S = pred_list[0]
+
+        loss = weighted_bce_loss(S, P_gt).item()
+        P_hard = hard_perm_from_scores(S)
+        tp, fp, fn, tn = permutation_confusion_counts(P_hard, P_gt)
+        n_tot = tp + fp + fn + tn
+        _, _, f1 = permutation_precision_recall_f1(tp, fp, fn)
+        metrics = {"loss": loss, "acc": (tp + tn) / n_tot if n_tot > 0 else 0.0, "f1": f1}
+        counts = {"tp": tp, "fp": fp, "fn": fn, "tn": tn}
+
+        pred_for_plot = P_hard
+        if use_hungarian:
+            sim = S.unsqueeze(0)
+            n1 = torch.tensor([S.shape[0]], dtype=torch.int32, device=dev)
+            n2 = torch.tensor([S.shape[1]], dtype=torch.int32, device=dev)
+            H = pygmtools.hungarian(sim, n1=n1, n2=n2).squeeze(0).to(dev)
+            htp, hfp, hfn, htn = permutation_confusion_counts(H, P_gt)
+            _, _, metrics["hungarian_f1"] = permutation_precision_recall_f1(htp, hfp, hfn)
+            counts.update({"htp": htp, "hfp": hfp, "hfn": hfn, "htn": htn})
+            pred_for_plot = H
+        return metrics, counts, pred_for_plot.cpu()
+
+    # ---- public: test set --------------------------------------------------
+    def run_test_set(self, save_images: bool = True, use_hungarian: bool = True,
+                     max_images: Optional[int] = None, match_display: str = "all") -> dict:
+        """
+        Evaluate the whole test set and (optionally) save one match image per pair
+        under <models_path>/test/. Writes test_metrics.json + test_metrics.csv.
+        The aggregate F1/precision/recall use the SAME micro-average as
+        evaluate_real_set in the training script. Returns the aggregate dict.
+        """
+        per_pair: List[dict] = []
+        total_loss = 0.0
+        tp = fp = fn = tn = 0
+        h_tp = h_fp = h_fn = h_tn = 0
+        total_entries = 0
+
+        for idx, (d1, d2, P_gt) in enumerate(tqdm(self.test_list, desc="Test set", ncols=80)):
+            metrics, counts, pred = self._eval_pair(d1, d2, P_gt, use_hungarian)
+            name = str(getattr(d1, "name", None) or f"pair{idx}")
+            safe_name = "".join(c if (c.isalnum() or c in "-_") else "_" for c in name)
+            per_pair.append({"idx": idx, "name": name, **metrics})
+
+            total_loss += metrics["loss"]
+            tp += counts["tp"]; fp += counts["fp"]; fn += counts["fn"]; tn += counts["tn"]
+            total_entries += counts["tp"] + counts["fp"] + counts["fn"] + counts["tn"]
+            if use_hungarian:
+                h_tp += counts["htp"]; h_fp += counts["hfp"]; h_fn += counts["hfn"]; h_tn += counts["htn"]
+
+            if save_images and (max_images is None or idx < max_images):
+                out = os.path.join(self.test_out_dir, f"{idx:04d}_{safe_name}.png")
+                try:
+                    plot_two_graphs_with_matching(
+                        [d1, d2], gt_perm=P_gt, pred_perm=pred,
+                        original_graphs=self.original_graphs, noise_graphs=self.noise_graphs,
+                        path=out, match_display=match_display,
+                        title=f"[{idx}] {name} | F1={metrics['f1']:.3f}"
+                        + (f" | HungF1={metrics.get('hungarian_f1', float('nan')):.3f}" if use_hungarian else ""),
+                    )
+                except Exception as e:
+                    print(f"  [warn] could not plot pair {idx} ({name}): {e}")
+
+        n = len(self.test_list)
+        # micro-average over ALL entries (global tp/fp/fn), like evaluate_real_set
+        avg_loss = total_loss / n if n > 0 else 0.0
+        avg_acc = (tp + tn) / total_entries if total_entries > 0 else 0.0
+        avg_prec, avg_rec, avg_f1 = permutation_precision_recall_f1(tp, fp, fn)
+        agg = {"loss": avg_loss, "acc": avg_acc,
+               "precision": avg_prec, "recall": avg_rec, "f1": avg_f1}
+        if use_hungarian:
+            h_acc = (h_tp + h_tn) / total_entries if total_entries > 0 else 0.0
+            h_prec, h_rec, h_f1 = permutation_precision_recall_f1(h_tp, h_fp, h_fn)
+            agg.update({"hungarian_acc": h_acc, "hungarian_precision": h_prec,
+                        "hungarian_recall": h_rec, "hungarian_f1": h_f1})
+
+        with open(os.path.join(self.test_out_dir, "test_metrics.json"), "w") as f:
+            json.dump({"experiment": self.experiment, "reference": self.reference,
+                       "n_pairs": n, "aggregate": agg}, f, indent=2)
+        self._write_csv(os.path.join(self.test_out_dir, "test_metrics.csv"), per_pair, use_hungarian)
+
+        print("\n" + "=" * 60)
+        print(f"TEST SET RESULTS ({self.experiment}) | {n} pairs")
+        for k, v in agg.items():
+            print(f"  {k:18}: {v:.4f}")
+        if save_images:
+            saved = n if max_images is None else min(max_images, n)
+            print(f"  saved {saved} match image(s) in {self.test_out_dir}")
+        print("=" * 60)
+        return agg
+
+    @staticmethod
+    def _write_csv(path: str, rows: List[dict], use_hungarian: bool):
+        cols = ["idx", "name", "loss", "acc", "f1"] + (["hungarian_f1"] if use_hungarian else [])
+        with open(path, "w") as f:
+            f.write(",".join(cols) + "\n")
+            for r in rows:
+                f.write(",".join(str(r.get(c, "")) for c in cols) + "\n")
+
+    # ---- public: arbitrary pair (NOT from train/val/test) ------------------
+    def infer_from_nx(self, g1_nx: nx.DiGraph, g2_nx: nx.DiGraph,
+                      save_path: Optional[str] = None, use_hungarian: bool = True) -> torch.Tensor:
+        """
+        Match two RAW networkx graphs (not from the preprocessed datasets).
+        Features are normalized with norm_stats.pt so the model sees the training
+        scale. Returns the match matrix and optionally saves the plot.
+        """
+        pair: List[Tuple[Data, Data, torch.Tensor]] = []
+        generate_matching_pair_as_data(g1_nx, g2_nx, pair)
+        d1, d2, P_gt = pair[0]
+        if self.mean is not None and self.std is not None:
+            d1, d2 = normalize_graph(d1, d2, self.mean, self.std)
+        else:
+            print("  [WARNING] no norm_stats: inferring on RAW (un-normalized) features.")
+
+        pred = self._predict(d1, d2, use_hungarian=use_hungarian).cpu()
+        plot_two_graphs_with_matching(
+            [d1, d2], gt_perm=P_gt, pred_perm=pred,
+            original_graphs=[g1_nx], noise_graphs=[g2_nx],
+            path=save_path, match_display="all",
+        )
+        return pred
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Test a trained PGM model and save match images.")
+    ap.add_argument("experiment", help="Experiment id, e.g. adj_glob_95 / fully_no_glob_65.")
+    ap.add_argument("--gnn-path", default=GNN_PATH, help="GNN root (default: ./GNN/).")
+    ap.add_argument("--reference", default=None, help="Override reference variant (adj/fully/equal).")
+    ap.add_argument("--checkpoint", choices=["best", "final"], default="best")
+    ap.add_argument("--no-images", action="store_true", help="Only compute metrics, no images.")
+    ap.add_argument("--max-images", type=int, default=None, help="Save images for the first N pairs.")
+    ap.add_argument("--no-hungarian", action="store_true", help="Skip the Hungarian assignment.")
+    ap.add_argument("--match-display", choices=["all", "correct", "wrong"], default="all")
+    args = ap.parse_args()
+
+    tester = PGMTester(args.experiment, gnn_path=args.gnn_path,
+                       reference=args.reference, checkpoint=args.checkpoint)
+    tester.run_test_set(save_images=not args.no_images, use_hungarian=not args.no_hungarian,
+                        max_images=args.max_images, match_display=args.match_display)
+
+
+if __name__ == "__main__":
+    main()
