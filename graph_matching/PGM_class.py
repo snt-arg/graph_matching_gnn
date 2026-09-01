@@ -2146,6 +2146,7 @@ class PartialGraphMatching:
 
 
     def load_best_model(self):
+        print(f"[INFO] Loading model weights from: {self.best_model_path}")
         checkpoint = torch.load(self.best_model_path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
