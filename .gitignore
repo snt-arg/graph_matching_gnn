@@ -11,3 +11,8 @@ graph_matching/tb_logs
 Colab Notebooks/tb_logs/
 core
 GNN/
+
+# W&B run data -- local artefacts, never committed
+wandb/
+__pycache__/
+tb_logs/
