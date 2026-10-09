@@ -316,6 +316,7 @@ class EdgeMatcher:
 
     name = "gnn-edge"
     display = "edge-feature GNN (EdgeAwareGATv2 + Sinkhorn)"
+    supports_mcd = True
 
     def __init__(self, model_dir, checkpoint="best_val_model.pt", device=None):
         self.model_dir = str(model_dir)
@@ -348,6 +349,14 @@ class EdgeMatcher:
         self.hparams = dict(hp)
         self.hparams["sinkhorn_max_iter"] = int(params["sinkhorn_max_iter"])
         self.hparams["sinkhorn_tau"] = float(params["sinkhorn_tau"])
+
+        # Monte Carlo Dropout settings, driven by the dashboard's MCD controls. The model is built
+        # with dropout 0 (eval only), so MCD re-enables the embedding nn.Dropout layers at rate p
+        # for the stochastic passes. Default p is the rate the checkpoint was trained with.
+        self.trained_dropout_emb = float(params.get("dropout_emb", 0.0))
+        self.trained_attn_dropout = float(params.get("attn_dropout", 0.0))
+        self.mcd = {"enabled": False, "passes": 30, "mode": "sinkhorn",
+                    "p": self.trained_dropout_emb, "p_attn": self.trained_attn_dropout}
 
         self.model = MatchingModel_EdgeAwareGATv2SinkhornWBCE(
             in_dim=hp["in_dim"], hidden_dim=hp["hidden_dim"], out_dim=hp["out_dim"],
@@ -412,7 +421,92 @@ class EdgeMatcher:
         h1, h2 = embeddings[0]
         return S, perm, h1, h2
 
+    # ── Monte Carlo Dropout ──────────────────────────────────────────────────────────────────
+    # Mirrors PGM_class.predict_matching_matrix's two MC paths for the node models:
+    #   "sinkhorn" (mc_samples):          mean/std of the Sinkhorn score per cell, Hungarian on the mean
+    #   "affinity" (mc_affinity_samples): mean/std of sim_normed per cell, then ONE Sinkhorn + Hungarian
+    # The embedding nn.Dropout layers run at rate p and the GATv2 attention dropout at p_attn
+    # (0 = off). PGM_class's model.train() switches both on at the trained rates.
+
+    def set_mcd(self, enabled, passes=None, mode=None, p=None, p_attn=None):
+        self.mcd["enabled"] = bool(enabled)
+        if passes is not None:
+            self.mcd["passes"] = max(1, int(passes))
+        if mode is not None:
+            if mode not in ("sinkhorn", "affinity"):
+                raise ValueError(f"MCD mode must be 'sinkhorn' or 'affinity', got {mode!r}")
+            self.mcd["mode"] = mode
+        if p is not None:
+            self.mcd["p"] = float(p)
+        if p_attn is not None:
+            self.mcd["p_attn"] = float(p_attn)
+
+    def _set_dropout(self, p, p_attn, active):
+        for m in self.model.modules():
+            if isinstance(m, nn.Dropout):
+                m.p = p
+                m.train(active)
+            elif isinstance(m, GATv2Conv):   # attention dropout: F.dropout(alpha, p=self.dropout, training=self.training)
+                m.dropout = p_attn
+                m.train(active and p_attn > 0)
+
+    def _sinkhorn_hungarian(self, sim_normed):
+        """sim_normed [n1, n2] -> (S [n1, n2], perm [n1, n2]); same Sinkhorn call as the model's
+        forward (transpose + dummy_row when n1 > n2) and the same Hungarian as `_forward`."""
+        N1, N2 = sim_normed.shape
+        transposed = N1 > N2
+        sim_input = (sim_normed.T if transposed else sim_normed).unsqueeze(0)
+        nr = torch.tensor([N2 if transposed else N1], dtype=torch.long, device=self.device)
+        nc = torch.tensor([N1 if transposed else N2], dtype=torch.long, device=self.device)
+        S = pygmtools.sinkhorn(sim_input, n1=nr, n2=nc, dummy_row=(N1 != N2),
+                               max_iter=self.model.sinkhorn_max_iter, tau=self.model.sinkhorn_tau)
+        if transposed:
+            S = S.transpose(-2, -1)
+        n1 = torch.tensor([N1], dtype=torch.int32, device=self.device)
+        n2 = torch.tensor([N2], dtype=torch.int32, device=self.device)
+        perm = pygmtools.hungarian(S, n1=n1, n2=n2).squeeze(0)
+        return S.squeeze(0), perm
+
+    def _forward_mcd(self, ga, gs):
+        """-> dict of torch tensors: affinity / sim_normed / S (means over the passes), perm,
+        uncertainty (per-cell std of S in "sinkhorn" mode, of sim_normed in "affinity" mode)."""
+        passes, mode, p, p_attn = (self.mcd["passes"], self.mcd["mode"], self.mcd["p"],
+                                   self.mcd["p_attn"])
+        d1, d2 = self._prep(ga), self._prep(gs)
+        b1 = torch.zeros(d1.num_nodes, dtype=torch.long, device=self.device)
+        b2 = torch.zeros(d2.num_nodes, dtype=torch.long, device=self.device)
+        S_s, aff_s, sn_s = [], [], []
+        try:
+            self._set_dropout(p, p_attn, active=True)
+            with torch.no_grad():
+                for _ in range(passes):
+                    soft_list, embeddings = self.model(
+                        d1, d2, batch_idx1=b1, batch_idx2=b2, inference=True)
+                    h1, h2 = embeddings[0]
+                    aff = h1 @ h2.T
+                    S_s.append(soft_list[0])
+                    aff_s.append(aff)
+                    sn_s.append(self.model.inst_norm(aff.unsqueeze(0).unsqueeze(1)).squeeze(1).squeeze(0))
+        finally:
+            self._set_dropout(0.0, 0.0, active=False)   # back to the deterministic eval model
+            self.model.eval()
+        S_stack, sn_stack = torch.stack(S_s), torch.stack(sn_s)
+        sim_normed = sn_stack.mean(0)
+        if mode == "sinkhorn":
+            S = S_stack.mean(0)
+            n1 = torch.tensor([S.shape[0]], dtype=torch.int32, device=self.device)
+            n2 = torch.tensor([S.shape[1]], dtype=torch.int32, device=self.device)
+            perm = pygmtools.hungarian(S.unsqueeze(0), n1=n1, n2=n2).squeeze(0)
+            unc = S_stack.std(0) if passes > 1 else torch.zeros_like(S)
+        else:
+            S, perm = self._sinkhorn_hungarian(sim_normed)
+            unc = sn_stack.std(0) if passes > 1 else torch.zeros_like(sim_normed)
+        return {"affinity": torch.stack(aff_s).mean(0), "sim_normed": sim_normed,
+                "S": S, "perm": perm, "uncertainty": unc}
+
     def match(self, a, s):
+        if self.mcd["enabled"]:
+            return self._match_mcd(a, s)
         g1, g2 = a.graph, s.graph
         S, perm, h1, h2 = self._forward(g1, g2)
         affinity_t = h1 @ h2.T
@@ -431,6 +525,17 @@ class EdgeMatcher:
             "perm":       perm_np,
         }
         rows, cols = np.where(perm_np > 0)
+        pairs = {(str(g1_nodes[r]), str(g2_nodes[c])) for r, c in zip(rows, cols)}
+        return pairs, ints, g1_nodes, g2_nodes
+
+    def _match_mcd(self, a, s):
+        g1, g2 = a.graph, s.graph
+        out = self._forward_mcd(g1, g2)
+        g1_nodes, g2_nodes = list(g1.nodes()), list(g2.nodes())
+        ints = {k: v.detach().cpu().numpy() for k, v in out.items()}
+        ints["mcd"] = {"mode": self.mcd["mode"], "passes": self.mcd["passes"], "p": self.mcd["p"],
+                       "p_attn": self.mcd["p_attn"]}
+        rows, cols = np.where(ints["perm"] > 0)
         pairs = {(str(g1_nodes[r]), str(g2_nodes[c])) for r, c in zip(rows, cols)}
         return pairs, ints, g1_nodes, g2_nodes
 
