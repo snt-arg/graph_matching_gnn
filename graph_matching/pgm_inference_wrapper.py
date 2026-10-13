@@ -16,13 +16,10 @@ import os
 PGM_PATH = '/root/workspace/src/graph_matching_gnn/graph_matching/graph_matching'
 if PGM_PATH not in sys.path:
     sys.path.append(PGM_PATH)
-
-
-from PGM_class import (PartialGraphMatching,
-                       MatchingModel_GATv2SinkhornTopK,
-                       MatchingModel_MLPGATv2SinkhornBCE,
-                       MatchingModel_GATv2Sinkhorn,
-                       MatchingModel_MLPGATv2SinkhornWBCE)
+# edge_model.py (the only loader for the edge-feature models) sits next to this script
+EDGE_MODEL_PATH = os.path.dirname(os.path.abspath(__file__))
+if EDGE_MODEL_PATH not in sys.path:
+    sys.path.append(EDGE_MODEL_PATH)
 
 
 # Model to load — pick one:
@@ -30,34 +27,44 @@ from PGM_class import (PartialGraphMatching,
 #   "ws_room_dropout_noise_inc_BCE"       → MatchingModel_MLPGATv2SinkhornBCE  (MLP + BCE)
 #   "ws_room_dropout_noise_inc_BCE_noMLP" → MatchingModel_GATv2Sinkhorn  (no MLP, BCE)
 #   "ws_room_dropout_noise_inc_WBCE"      → MatchingModel_MLPGATv2SinkhornWBCE  (MLP + weighted BCE)
-MODEL = "ws_room_dropout_noise_inc_WBCE"
+#   "adj_glob_65_edgefeat_rooms"          → edge-feature model, loaded through edge_model.EdgeMatcher
+#   "adj_no_glob_65_edge"                 → edge-feature model, loaded through edge_model.EdgeMatcher
+MODEL = "adj_glob_65_edgefeat_rooms"
 
-# Map model name → (model_class, preprocessed_data_subfolder)
+# Edge-feature models: node x = [type, length], all geometry in a 9-dim edge_attr that
+# edge_model builds from the graph at load time. PartialGraphMatching cannot load them.
+_EDGE_MODELS = ("adj_glob_65_edgefeat_rooms", "adj_no_glob_65_edge")
+
+# Map model name → (model_class name, preprocessed_data_subfolder)
 _MODEL_CONFIGS = {
-    "ws_room_dropout_noise":               (MatchingModel_GATv2SinkhornTopK,    "ws_room_dropout_noise"),
-    "ws_room_dropout_noise_inc_BCE":       (MatchingModel_MLPGATv2SinkhornBCE,  "ws_room_dropout_noise_inc"),
-    "ws_room_dropout_noise_inc_BCE_noMLP": (MatchingModel_GATv2Sinkhorn,        "ws_room_dropout_noise_inc"),
-    "ws_room_dropout_noise_inc_WBCE":      (MatchingModel_MLPGATv2SinkhornWBCE, "ws_room_dropout_noise_inc"),
+    "ws_room_dropout_noise":               ("MatchingModel_GATv2SinkhornTopK",    "ws_room_dropout_noise"),
+    "ws_room_dropout_noise_inc_BCE":       ("MatchingModel_MLPGATv2SinkhornBCE",  "ws_room_dropout_noise_inc"),
+    "ws_room_dropout_noise_inc_BCE_noMLP": ("MatchingModel_GATv2Sinkhorn",        "ws_room_dropout_noise_inc"),
+    "ws_room_dropout_noise_inc_WBCE":      ("MatchingModel_MLPGATv2SinkhornWBCE", "ws_room_dropout_noise_inc"),
 }
+
+GNN_PATH = '/root/workspace/src/graph_matching_gnn/GNN'
 
 
 def load_pgm_model():
     if MODEL not in _MODEL_CONFIGS:
-        raise ValueError(f"Unknown MODEL '{MODEL}'. Choose from: {list(_MODEL_CONFIGS.keys())}")
+        raise ValueError(f"Unknown MODEL '{MODEL}'. Choose from: "
+                         f"{list(_MODEL_CONFIGS.keys()) + list(_EDGE_MODELS)}")
 
-    model_class, data_subfolder = _MODEL_CONFIGS[MODEL]
+    import PGM_class  # only the node-feature models need it
+    class_name, data_subfolder = _MODEL_CONFIGS[MODEL]
+    model_class = getattr(PGM_class, class_name)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"PGM using device: {device}, model: {MODEL}")
 
-    GNN_PATH = '/root/workspace/src/graph_matching_gnn/GNN'
     model_save_path = os.path.join(GNN_PATH, 'models', "partial_graph_matching", MODEL)
     data_paths = {
         "equal":   os.path.join(GNN_PATH, "preprocessed", "graph_matching", "equal"),
         "partial": os.path.join(GNN_PATH, "preprocessed", "partial_graph_matching", data_subfolder),
     }
 
-    pgm_model = PartialGraphMatching(
+    pgm_model = PGM_class.PartialGraphMatching(
         model_class=model_class,
         data_paths=data_paths,
         model_save_path=model_save_path,
@@ -68,6 +75,21 @@ def load_pgm_model():
     print(f"PGM model initialized: {MODEL}")
 
     return pgm_model
+
+
+class _Wrapped:
+    """EdgeMatcher.match reads `.graph`, the attribute of the dashboard's GraphWrapper."""
+    def __init__(self, g):
+        self.graph = g
+
+
+def edge_model_matching(g1, g2):
+    """Hungarian 0/1 matrix [|g1|, |g2|] from an edge-feature model, rows/cols in g1/g2 node order."""
+    import edge_model
+    matcher = edge_model.EdgeMatcher(os.path.join(GNN_PATH, 'models', "partial_graph_matching", MODEL))
+    _, ints, g1_nodes, g2_nodes = matcher.match(_Wrapped(g1), _Wrapped(g2))
+    assert list(g1_nodes) == list(g1.nodes()) and list(g2_nodes) == list(g2.nodes())
+    return torch.as_tensor(ints["perm"])
 
 
 def run_pgm_inference(graph1, graph2, output_path):
@@ -88,13 +110,14 @@ def run_pgm_inference(graph1, graph2, output_path):
         print(f"Graph 1: {g1.number_of_nodes()} nodes, {g1.number_of_edges()} edges")
         print(f"Graph 2: {g2.number_of_nodes()} nodes, {g2.number_of_edges()} edges")
 
-        # Load PGM model
-        pgm_model = load_pgm_model()
-
-
         # Perform inference
         print("Running PGM inference...")
-        matching_matrix = pgm_model.infer_matching(g1, g2, discrete=True)
+        if MODEL in _EDGE_MODELS:
+            print(f"PGM model: {MODEL} (edge-feature, via edge_model.EdgeMatcher)")
+            matching_matrix = edge_model_matching(g1, g2)
+        else:
+            pgm_model = load_pgm_model()
+            matching_matrix = pgm_model.infer_matching(g1, g2, discrete=True)
 
 
         # Save result (matching matrix and nodes of the two graphs that correspond to the matrix indices)
