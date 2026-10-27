@@ -29,11 +29,13 @@ if EDGE_MODEL_PATH not in sys.path:
 #   "ws_room_dropout_noise_inc_WBCE"      → MatchingModel_MLPGATv2SinkhornWBCE  (MLP + weighted BCE)
 #   "adj_glob_65_edgefeat_rooms"          → edge-feature model, loaded through edge_model.EdgeMatcher
 #   "adj_no_glob_65_edge"                 → edge-feature model, loaded through edge_model.EdgeMatcher
-MODEL = "adj_glob_65_edgefeat_rooms"
+#   "adj_glob_65_edgefeat_rooms_hp_real"  → edge-feature model ("Final model" in the dashboard),
+#                                           loaded through edge_model.EdgeMatcher
+MODEL = "adj_glob_65_edgefeat_rooms_hp_real"
 
 # Edge-feature models: node x = [type, length], all geometry in a 9-dim edge_attr that
 # edge_model builds from the graph at load time. PartialGraphMatching cannot load them.
-_EDGE_MODELS = ("adj_glob_65_edgefeat_rooms", "adj_no_glob_65_edge")
+_EDGE_MODELS = ("adj_glob_65_edgefeat_rooms", "adj_no_glob_65_edge", "adj_glob_65_edgefeat_rooms_hp_real")
 
 # Map model name → (model_class name, preprocessed_data_subfolder)
 _MODEL_CONFIGS = {
